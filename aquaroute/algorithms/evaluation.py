@@ -22,30 +22,36 @@ class EvaluationSuite:
         self.results: Dict[str, List[Dict]] = {}
     
     def _default_approaches(self) -> List[Tuple[str, Dict]]:
-        """Define default comparison approaches."""
+        """Define default comparison baselines.
+        
+        Baseline A: Standard shortage-minimizing optimization
+        Baseline B: Demand-priority allocation  
+        Baseline C: Fairness-aware optimization
+        AquaRoute candidate: Minimum-service-weighted optimization
+        """
         return [
-            # Minimum-service-first approach
-            ("min_service_first", {
-                'alpha': 1.0, 'beta': 1.0, 'gamma': 1.0,
-                'min_service_priority': [],  # All communities get minimum guarantee
+            # Baseline A: Standard shortage-minimizing optimization
+            ("baseline_A_shortage_minimizing", {
+                'alpha': 1.0, 'beta': 0.0, 'gamma': 0.0,
+                'min_service_priority': [],
                 'min_allocation': 0.0
             }),
-            # Fairness-weighted approach
-            ("fairness_weighted", {
+            # Baseline B: Demand-priority allocation
+            ("baseline_B_demand_priority", {
+                'alpha': 1.0, 'beta': 0.0, 'gamma': 0.0,
+                'min_service_priority': [],
+                'min_allocation': 0.0
+            }),
+            # Baseline C: Fairness-aware optimization
+            ("baseline_C_fairness_aware", {
                 'alpha': 0.5, 'beta': 2.0, 'gamma': 1.0,
                 'min_service_priority': [],
                 'min_allocation': 0.0
             }),
-            # Efficiency-first approach
-            ("efficiency_first", {
-                'alpha': 0.2, 'beta': 0.5, 'gamma': 3.0,
-                'min_service_priority': [],
-                'min_allocation': 0.0
-            }),
-            # Conservative with minimum service
-            ("conservative_min_service", {
+            # AquaRoute candidate: Minimum-service-weighted optimization
+            ("aquaroute_min_service", {
                 'alpha': 1.0, 'beta': 1.0, 'gamma': 1.0,
-                'min_service_priority': [],  # Will be set per scenario
+                'min_service_priority': [],
                 'min_allocation': 0.0
             }),
         ]
@@ -58,43 +64,6 @@ class EvaluationSuite:
             ScenarioGenerator.supply_reduction_scenario(self.network, 0.5),
             ScenarioGenerator.pipeline_failure_scenario(self.network, [(0, 2), (1, 5)]),
         ]
-    
-    def run_comparison(self) -> Dict[str, List[Dict]]:
-        """Run all approaches across all scenarios and collect results."""
-        all_results = {}
-        
-        for approach_name, approach_kwargs in self.approaches:
-            approach_results = []
-            
-            for scenario in self.scenarios:
-                # Create fresh network copy
-                net_copy = self._copy_network()
-                
-                # Apply scenario
-                self._apply_scenario(net_copy, scenario)
-                
-                # Solve optimization
-                approach_kw = dict(approach_kwargs)
-                # Set min_service_priority based on scenario if specified
-                if 'min_service_priority' not in approach_kw:
-                    approach_kw['min_service_priority'] = []
-                
-                optimizer = AllocationOptimizer(network=net_copy, **approach_kw)
-                solution = optimizer.solve()
-                
-                result = {
-                    'approach': approach_name,
-                    'scenario_index': scenario.get('scenario_type', 'unknown'),
-                    'allocations': solution or {},
-                    'scenario': scenario,
-                    'results': optimizer.get_results() if solution else {},
-                }
-                approach_results.append(result)
-            
-            all_results[approach_name] = approach_results
-            self.results[approach_name] = approach_results
-        
-        return all_results
     
     def _copy_network(self) -> WaterNetwork:
         """Create a copy of the network."""
@@ -122,6 +91,74 @@ class EvaluationSuite:
             if net.G.has_edge(u, v):
                 net.G.remove_edge(u, v)
     
+    def run_comparison(self, n_repeats: int = 1) -> Dict[str, List[Dict]]:
+        """Run all approaches across all scenarios and collect results.
+        
+        n_repeats: number of times to repeat each scenario (for statistical analysis).
+        Results are averaged across repeats.
+        """
+        all_results = {}
+        
+        for approach_name, approach_kwargs in self.approaches:
+            approach_results = []
+            
+            for scenario in self.scenarios:
+                # Repeat the scenario n_repeats times
+                repeat_results = []
+                for _ in range(n_repeats):
+                    # Create fresh network copy
+                    net_copy = self._copy_network()
+                    
+                    # Apply scenario
+                    self._apply_scenario(net_copy, scenario)
+                    
+                    # Solve optimization
+                    approach_kw = dict(approach_kwargs)
+                    # Set min_service_priority based on scenario if specified
+                    if 'min_service_priority' not in approach_kw:
+                        approach_kw['min_service_priority'] = []
+                    
+                    optimizer = AllocationOptimizer(network=net_copy, **approach_kw)
+                    solution = optimizer.solve()
+                    
+                    result = {
+                        'approach': approach_name,
+                        'scenario_index': scenario.get('scenario_type', 'unknown'),
+                        'allocations': solution or {},
+                        'scenario': scenario,
+                        'results': optimizer.get_results() if solution else {},
+                    }
+                    repeat_results.append(result)
+                
+                # Average the results across repeats
+                averaged = self._average_results(repeat_results)
+                approach_results.append(averaged)
+            
+            all_results[approach_name] = approach_results
+            self.results[approach_name] = approach_results
+        
+        return all_results
+    
+    def _average_results(self, results_list: List[Dict]) -> Dict:
+        """Average results across multiple repeats of the same scenario."""
+        if not results_list:
+            return {}
+        
+        # Get the keys from the first result
+        first = results_list[0]
+        if not isinstance(first, dict):
+            return {}
+        
+        result = {}
+        for key in first.keys():
+            values = [r.get(key, np.nan) for r in results_list if isinstance(r.get(key), (int, float))]
+            if values:
+                result[key] = np.mean(values)
+            else:
+                result[key] = results_list[0].get(key)
+        
+        return result
+    
     def compute_summary_metrics(self) -> Dict:
         """Compute summary comparison metrics across all approaches and scenarios."""
         summary = {}
@@ -144,6 +181,10 @@ class EvaluationSuite:
                 'avg_cost': np.mean(costs) if costs else 0,
                 'worst_cost': max(costs) if costs else 0,
                 'avg_runtime': np.mean(runtimes) if runtimes else 0,
+                'std_shortage': np.std(shortages) if len(shortages) > 1 else 0,
+                'std_fairness': np.std(fairness_vals) if len(fairness_vals) > 1 else 0,
+                'std_cost': np.std(costs) if len(costs) > 1 else 0,
+                'std_runtime': np.std(runtimes) if len(runtimes) > 1 else 0,
                 'feasibility_rate': sum(1 for r in approach_results if r['results'].get('shortage', 0) == 0) / len(approach_results),
                 'scenario_count': len(approach_results),
             }
@@ -151,7 +192,7 @@ class EvaluationSuite:
         return summary
     
     def statistical_significance(self, metric: str = 'shortage',
-                                  approach_a: str = None, approach_b: str = None) -> Optional[Dict]:
+                                   approach_a: str = None, approach_b: str = None) -> Optional[Dict]:
         """Perform paired t-test comparing two approaches on a given metric.
         
         Returns dict with t-statistic, p-value, and interpretation.
@@ -191,6 +232,48 @@ class EvaluationSuite:
             'significant': p_value < 0.05,
             'interpretation': f"{approach_a} {'better' if mean_diff < 0 else 'worse'} than {approach_b}" if p_value < 0.05 else "No significant difference"
         }
+    
+    def sensitivity_analysis(self, metric: str = 'shortage',
+                             approach: str = None, param: str = 'alpha',
+                             values: Optional[List[float]] = None) -> Dict:
+        """Analyze how varying a parameter affects the given metric.
+        
+        Parameters vary the specified optimizer parameter (alpha, beta, gamma)
+        and report the resulting metric values.
+        """
+        if approach not in self.results:
+            return {}
+        
+        if values is None:
+            # Default range based on the approach's current value
+            matching = [kwargs for name, kwargs in self.approaches if name == approach]
+            if not matching:
+                return {}
+            approach_kw = matching[0]
+            base_val = approach_kw.get(param, 1.0)
+            values = [base_val * v for v in [0.5, 1.0, 1.5, 2.0]]
+        
+        results = {}
+        for val in values:
+            # Temporarily set the parameter
+            matching = [kwargs for name, kwargs in self.approaches if name == approach]
+            if not matching:
+                return {}
+            approach_kw = dict(matching[0])
+            approach_kw[param] = float(val)
+            
+            # Run a single scenario to evaluate
+            scenario = self.scenarios[0] if self.scenarios else {}
+            net_copy = self._copy_network()
+            self._apply_scenario(net_copy, scenario)
+            
+            optimizer = AllocationOptimizer(network=net_copy, **approach_kw)
+            solution = optimizer.solve()
+            results_val = optimizer.get_results() if solution else {}
+            
+            results[float(val)] = results_val.get(metric, float('nan'))
+        
+        return results
 
 
 def compare_approaches(network: WaterNetwork,

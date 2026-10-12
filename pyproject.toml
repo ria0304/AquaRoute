@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aquaroute"
+version = "0.1.0"
+description = "Algorithmic optimization for reliable community water distribution"
+requires-python = ">=3.10"
+keywords = ["water-distribution", "optimization", "fairness", "research"]
+
+[project.dependencies]
+networkx = ">=2.4"
+pyomo = ">=5.7"
+numpy = ">=1.22"
+
+[project.scripts]
+aquaroute-dashboard = "aquaroute.scripts.streamlit_dashboard:main"
+
+[tool.pytest]
+testpaths = ["aquaroute/tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+cache_dir = ".pytest_cache"

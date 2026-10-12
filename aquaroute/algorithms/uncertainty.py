@@ -3,6 +3,7 @@ from __future__ import annotations
 import numpy as np
 from typing import Dict, List, Optional, Tuple
 from .optimizer import WaterNetwork, AllocationOptimizer, compute_shortage, compute_fairness
+import copy
 
 
 class ScenarioGenerator:
@@ -28,47 +29,65 @@ class ScenarioGenerator:
     
     @staticmethod
     def demand_spike_scenario(network: WaterNetwork, spike_factor: float = 1.5) -> Dict:
-        """Elevated demand scenario (e.g., during heat wave or agricultural season)."""
+        """Elevated demand scenario (e.g., during heat wave or agricultural season).
+        
+        Creates an independent copy of the network so the baseline is not mutated.
+        """
+        # Create an independent copy of the network
+        net_copy = copy.copy(network)
+        net_copy.G = copy.deepcopy(network.G)
+        
+        # Apply demand spike to the copy
         demands = {}
-        for c in network.get_communities():
-            base_demand = network.G.nodes[c]['demand']
+        for c in net_copy.get_communities():
+            base_demand = net_copy.G.nodes[c]['demand']
             demands[c] = base_demand * spike_factor
-        # Update network node demands
+        # Update copy node demands
         for c, d in demands.items():
-            network.G.nodes[c]['demand'] = d
+            net_copy.G.nodes[c]['demand'] = d
         
         return {
             'demands': demands,
-            'supply': {r: network.G.nodes[r].get('supply', float('inf'))
-                      for r in network.get_reservoirs()},
+            'supply': {r: net_copy.G.nodes[r].get('supply', float('inf'))
+                      for r in net_copy.get_reservoirs()},
             'failures': []
         }
     
     @staticmethod
     def supply_reduction_scenario(network: WaterNetwork, reduction_factor: float = 0.5) -> Dict:
-        """Reduced water supply scenario (e.g., during drought)."""
+        """Reduced water supply scenario (e.g., during drought).
+        
+        Creates an independent copy of the network so the baseline is not mutated.
+        """
+        # Create an independent copy of the network
+        net_copy = copy.copy(network)
+        net_copy.G = copy.deepcopy(network.G)
+        
+        # Apply supply reduction to the copy
         supply = {}
-        for r in network.get_reservoirs():
-            base_supply = network.G.nodes[r].get('supply', float('inf'))
+        for r in net_copy.get_reservoirs():
+            base_supply = net_copy.G.nodes[r].get('supply', float('inf'))
             supply[r] = base_supply * reduction_factor
-        # Update reservoir supplies
+        # Update copy reservoir supplies
         for r, s in supply.items():
-            network.G.nodes[r]['supply'] = s
+            net_copy.G.nodes[r]['supply'] = s
         
         return {
-            'demands': {c: network.G.nodes[c]['demand'] for c in network.get_communities()},
+            'demands': {c: net_copy.G.nodes[c]['demand'] for c in net_copy.get_communities()},
             'supply': supply,
             'failures': []
         }
     
     @staticmethod
     def pipeline_failure_scenario(network: WaterNetwork, failed_edges: List[Tuple[int, int]]) -> Dict:
-        """Specific pipeline links become unavailable."""
-        import copy
+        """Specific pipeline links become unavailable.
+        
+        Creates a copy of the network graph so the baseline is not mutated.
+        """
         net_copy = copy.copy(network)
         net_copy.G = network.G.copy()
         
-        # Remove failed pipelines from the graph
+        # Remove failed pipelines from the graph copy
         for u, v in failed_edges:
             if net_copy.G.has_edge(u, v):
                 net_copy.G.remove_edge(u, v)
@@ -85,28 +104,27 @@ class ScenarioGenerator:
                                        spike_factor: float = 1.3,
                                        reduction_factor: float = 0.6,
                                        failed_edges: Optional[List[Tuple[int, int]]] = None) -> Dict:
-        """Combined scenario: demand spike + supply reduction + pipeline failures."""
-        # Start with demand spike
-        scenario = ScenarioGenerator.demand_spike_scenario(network, spike_factor)
+        """Combined scenario: demand spike + supply reduction + pipeline failures.
         
-        # Apply supply reduction
-        supply_scenario = ScenarioGenerator.supply_reduction_scenario(network, reduction_factor)
-        scenario['supply'] = supply_scenario['supply']
+        Creates independent copies so the baseline network is never mutated.
+        """
+        # Start with demand spike on a copy
+        spike_scenario = ScenarioGenerator.demand_spike_scenario(network, spike_factor)
         
-        # Apply pipeline failures
+        # Apply supply reduction on a copy (original network unchanged)
+        reduction_scenario = ScenarioGenerator.supply_reduction_scenario(network, reduction_factor)
+        spike_scenario['supply'] = reduction_scenario['supply']
+        
+        # Apply pipeline failures on a copy
         if failed_edges:
             pipeline_scenario = ScenarioGenerator.pipeline_failure_scenario(network, failed_edges)
-            scenario['failures'] = pipeline_scenario['failures']
+            spike_scenario['failures'] = pipeline_scenario['failures']
         else:
-            scenario['failures'] = []
+            spike_scenario['failures'] = []
         
-        # Reset network demands back to baseline
-        for c in network.get_communities():
-            network.G.nodes[c]['demand'] = scenario['demands'][c] / spike_factor
-        for r in network.get_reservoirs():
-            network.G.nodes[r]['supply'] = scenario['supply'][r] / reduction_factor if reduction_factor < 1 else scenario['supply'][r]
-        
-        return scenario
+        # The copies already have their own network state; no need to reset
+        # since each scenario works on its own copy
+        return spike_scenario
 
 
 class FailureAnalyzer:

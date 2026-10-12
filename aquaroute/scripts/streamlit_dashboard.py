@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import streamlit as st
 import plotly.graph_objects as go
 import plotly.express as px
@@ -129,8 +130,11 @@ def main():
     if 'params' not in st.session_state:
         st.session_state.params = sidebar_controls(st.session_state.network)
     
-    network = st.session_state.network
+    original_network = st.session_state.network
     params = st.session_state.params
+    
+    # Work on a copy to avoid mutating the original network
+    network = copy.deepcopy(original_network)
     
     # Update network based on scenario parameters
     demands = {}
