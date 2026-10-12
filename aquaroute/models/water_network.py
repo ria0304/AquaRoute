@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-import numpy as np
-import pandas as pd
 from typing import Dict, List, Optional, Tuple
+
 import networkx as nx
 
 
@@ -80,6 +79,13 @@ class WaterNetwork:
                     return False  # unsatisfied demand
         return True
 
+
+    @classmethod
+    def from_json(cls, path) -> 'WaterNetwork':
+        """Load a network from a JSON file (see ``data/sample_network.json``)."""
+        import json
+        with open(path, "r") as fh:
+            return cls.from_dict(json.load(fh))
 
     @classmethod
     def from_dict(cls, data: Dict) -> 'WaterNetwork':

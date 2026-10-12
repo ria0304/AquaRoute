@@ -1,18 +1,15 @@
 from __future__ import annotations
 
 import copy
-import streamlit as st
-import plotly.graph_objects as go
-import plotly.express as px
-import numpy as np
+
 import pandas as pd
-from datetime import datetime
+import plotly.graph_objects as go
+import streamlit as st
 
-from aquaroute.models.water_network import WaterNetwork, create_sample_network
+from aquaroute.algorithms.evaluation import EvaluationSuite
 from aquaroute.algorithms.optimizer import AllocationOptimizer
-from aquaroute.algorithms.uncertainty import ScenarioGenerator, FailureAnalyzer
-from aquaroute.algorithms.evaluation import EvaluationSuite, compare_approaches
-
+from aquaroute.algorithms.uncertainty import ScenarioGenerator
+from aquaroute.models.water_network import WaterNetwork, create_sample_network
 
 st.set_page_config(
     page_title="AquaRoute — Algorithmic Optimization for Water Distribution",
@@ -97,12 +94,19 @@ def sidebar_controls(network: WaterNetwork) -> dict:
 def run_optimization(network, params):
     """Run the allocation optimization and return results."""
     with st.spinner("Solving allocation optimization..."):
+        if params['min_service']:
+            priority = [c for c in network.get_communities()
+                        if network.G.nodes[c].get('priority', 0) == 1]
+        else:
+            priority = []
+
         optimizer = AllocationOptimizer(
             network=network,
             alpha=params['alpha'],
             beta=params['beta'],
             gamma=params['gamma'],
-            min_service_priority=list(range(len(network.get_communities()))) if params['min_service'] else [],
+            strategy='weighted',
+            min_service_priority=priority,
             min_allocation=params['min_allocation'],
         )
         

@@ -1,0 +1,26 @@
+{
+  "name": "sample_community_network",
+  "description": "Synthetic benchmark network: 2 reservoirs, 5 communities, 9 pipelines with transshipment",
+  "reservoirs": [
+    {"node_id": 0, "capacity": 100.0, "supply": 100.0},
+    {"node_id": 1, "capacity": 80.0, "supply": 80.0}
+  ],
+  "communities": [
+    {"node_id": 2, "demand": 20.0, "priority": 1},
+    {"node_id": 3, "demand": 15.0, "priority": 2},
+    {"node_id": 4, "demand": 25.0, "priority": 1},
+    {"node_id": 5, "demand": 15.0, "priority": 3},
+    {"node_id": 6, "demand": 10.0, "priority": 2}
+  ],
+  "pipelines": [
+    {"from_node": 0, "to_node": 2, "capacity": 30.0, "delivery_cost": 1.0},
+    {"from_node": 0, "to_node": 3, "capacity": 20.0, "delivery_cost": 1.5},
+    {"from_node": 0, "to_node": 4, "capacity": 25.0, "delivery_cost": 1.2},
+    {"from_node": 1, "to_node": 5, "capacity": 20.0, "delivery_cost": 1.3},
+    {"from_node": 1, "to_node": 6, "capacity": 15.0, "delivery_cost": 1.1},
+    {"from_node": 2, "to_node": 5, "capacity": 15.0, "delivery_cost": 2.0},
+    {"from_node": 3, "to_node": 6, "capacity": 15.0, "delivery_cost": 2.0},
+    {"from_node": 4, "to_node": 5, "capacity": 15.0, "delivery_cost": 1.8},
+    {"from_node": 4, "to_node": 6, "capacity": 15.0, "delivery_cost": 1.9}
+  ]
+}

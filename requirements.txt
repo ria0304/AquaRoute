@@ -1,0 +1,10 @@
+# Core runtime dependencies (research-reproducible versions).
+# Generated from the development environment on 2026-10-12.
+networkx==3.6.1
+numpy==2.5.3
+pandas==3.0.5
+scipy==1.18.1
+pyomo==6.10.1
+
+# LP/MIP solver backend used for the optimization results.
+highspy==1.15.1

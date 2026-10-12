@@ -13,6 +13,12 @@ env/
 .coverage
 htmlcov/
 
+# Packaging / build artifacts
+build/
+dist/
+*.egg-info/
+.ruff_cache/
+
 # Environment variables and secrets
 .env
 .env.*
@@ -24,3 +30,6 @@ htmlcov/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Experiment outputs
+results/

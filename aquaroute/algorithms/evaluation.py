@@ -1,384 +1,259 @@
 from __future__ import annotations
 
+import copy
+from typing import Dict, List, Optional, Tuple
+
 import numpy as np
-from typing import Dict, List, Optional, Tuple, Callable
-from .optimizer import WaterNetwork, AllocationOptimizer, compute_shortage, compute_fairness, compute_delivery_cost
-from .uncertainty import ScenarioGenerator, FailureAnalyzer
+
+from aquaroute.models.water_network import WaterNetwork
+
+from .optimizer import AllocationOptimizer
+from .uncertainty import ScenarioGenerator
+
+
+def _priority_communities(network: WaterNetwork) -> List[int]:
+    """Communities with the highest (numerically lowest) priority level."""
+    communities = network.get_communities()
+    if not communities:
+        return []
+    levels = [network.G.nodes[c].get("priority", 0) for c in communities]
+    best = min(levels)
+    return [c for c, lvl in zip(communities, levels) if lvl == best]
 
 
 class EvaluationSuite:
-    """Compares optimization approaches across standardized scenarios.
-    
-    Evaluates and reports: demand satisfaction, shortage rate, fairness,
-    failure resilience, computational runtime, and feasibility.
+    """Compares allocation strategies across standardized scenarios.
+
+    Strategies are genuinely distinct algorithms (see
+    :class:`~aquaroute.algorithms.optimizer.AllocationOptimizer`), so the
+    comparison is meaningful rather than a relabelling of one LP.
     """
-    
+
     def __init__(self, network: WaterNetwork,
                  approaches: Optional[List[Tuple[str, Dict]]] = None,
-                 scenarios: Optional[List[Dict]] = None):
+                 scenarios: Optional[List[Dict]] = None,
+                 seed: int = 42):
         self.network = network
         self.approaches = approaches or self._default_approaches()
         self.scenarios = scenarios or self._default_scenarios()
+        self.seed = seed
         self.results: Dict[str, List[Dict]] = {}
-    
+
     def _default_approaches(self) -> List[Tuple[str, Dict]]:
-        """Define default comparison baselines.
-        
-        Baseline A: Standard shortage-minimizing optimization
-        Baseline B: Demand-priority allocation  
-        Baseline C: Fairness-aware optimization
-        AquaRoute candidate: Minimum-service-weighted optimization
-        """
+        priority = _priority_communities(self.network)
         return [
-# Baseline A: Shortage-minimizing optimization
-            # Objective: minimize total unmet demand only (alpha=1, beta=0, gamma=0).
-            # No consideration of fairness or delivery costs.
-            ("baseline_A_shortage_minimizing", {
-                'alpha': 1.0, 'beta': 0.0, 'gamma': 0.0,
-                'min_service_priority': [],
-                'min_allocation': 0.0
-            }),
-            # Baseline B: Shortage + fairness optimization
-            # Objective: balance total unmet demand and allocation fairness (alpha=1, beta=1, gamma=0).
-            # Delivery cost is ignored; allocations trade off between demand satisfaction and
-            # proportional equity across communities.
-            ("baseline_B_shortage_fairness", {
-                'alpha': 1.0, 'beta': 1.0, 'gamma': 0.0,
-                'min_service_priority': [],
-                'min_allocation': 0.0
-            }),
-            # Baseline C: Fairness-aware optimization
-            # Objective: weighted combination with strong fairness emphasis (alpha=0.5, beta=2.0, gamma=1.0).
-            # Fairness is given twice the weight of delivery cost and half the weight of shortage,
-            # reflecting a policy choice to prioritize equitable proportional delivery even at the
-            # cost of some unmet demand.
-            ("baseline_C_fairness_aware", {
-                'alpha': 0.5, 'beta': 2.0, 'gamma': 1.0,
-                'min_service_priority': [],
-                'min_allocation': 0.0
-            }),
-            # AquaRoute candidate: Minimum-service-weighted optimization
-            # Objective: balanced weights (alpha=1.0, beta=1.0, gamma=1.0) with minimum-service
-            # guarantees for priority communities. The distinguishing feature is not just the
-            # weight vector but the capability to enforce min_service_priority constraints, ensuring
-            # that communities flagged as priority receive at least min_allocation before secondary
-            # objectives are optimized, per lexicographic priority.
-            ("aquaroute_min_service", {
-                'alpha': 1.0, 'beta': 1.0, 'gamma': 1.0,
-                'min_service_priority': [],
-                'min_allocation': 0.0
+            # Baseline A: classic shortage minimisation (maximise delivered water).
+            ("baseline_A_shortage_min", {"strategy": "shortage_min"}),
+            # Baseline B: proportional allocation (share in proportion to demand).
+            ("baseline_B_proportional", {"strategy": "proportional"}),
+            # Baseline C: egalitarian / max-min fairness.
+            ("baseline_C_maxmin", {"strategy": "maxmin"}),
+            # Baseline D: uniform volumetric allocation.
+            ("baseline_D_uniform", {"strategy": "uniform"}),
+            # AquaRoute: weighted fairness/cost objective with minimum-service
+            # guarantees for the highest-priority communities.
+            ("aquaroute_weighted_min_service", {
+                "strategy": "weighted",
+                "alpha": 1.0, "beta": 1.0, "gamma": 1.0,
+                "min_service_priority": priority,
+                "min_allocation": 10.0,
             }),
         ]
-    
+
     def _default_scenarios(self) -> List[Dict]:
-        """Default set of evaluation scenarios."""
         return [
             ScenarioGenerator.normal_scenario(self.network),
             ScenarioGenerator.demand_spike_scenario(self.network, 1.5),
             ScenarioGenerator.supply_reduction_scenario(self.network, 0.5),
             ScenarioGenerator.pipeline_failure_scenario(self.network, [(0, 2), (1, 5)]),
         ]
-    
+
     def _copy_network(self) -> WaterNetwork:
-        """Create a copy of the network."""
         net = WaterNetwork()
-        net.G = self.network.G.copy()
-        # Copy node attributes
-        for n in net.G.nodes():
-            net.G.nodes[n].update(self.network.G.nodes[n])
+        net.G = copy.deepcopy(self.network.G)
+        net.n_reservoirs = self.network.n_reservoirs
+        net.n_communities = self.network.n_communities
         return net
-    
-    def _apply_scenario(self, net: WaterNetwork, scenario: Dict) -> None:
-        """Apply scenario modifications to a network copy."""
-        demands = scenario['demands']
-        for c, d in demands.items():
-            if net.G.has_node(c):
-                net.G.nodes[c]['demand'] = d
-        
-        supply = scenario['supply']
-        for r, s in supply.items():
-            if net.G.has_node(r):
-                net.G.nodes[r]['supply'] = s
-        
-        failures = scenario.get('failures', [])
-        for u, v in failures:
-            if net.G.has_edge(u, v):
-                net.G.remove_edge(u, v)
-    
-    def run_comparison(self, n_repeats: int = 1) -> Dict[str, List[Dict]]:
-        """Run all approaches across all scenarios and collect results.
-        
-        n_repeats: number of times to repeat each scenario (for statistical analysis).
-        Results are averaged across repeats.
-        """
-        all_results = {}
-        
+
+    def run_comparison(self, n_repeats: int = 1, seed: Optional[int] = None) -> Dict[str, List[Dict]]:
+        """Run every approach on every scenario, averaging over ``n_repeats``."""
+        all_results: Dict[str, List[Dict]] = {}
+
         for approach_name, approach_kwargs in self.approaches:
             approach_results = []
-            
             for scenario in self.scenarios:
-                # Repeat the scenario n_repeats times
-                repeat_results = []
-                for _ in range(n_repeats):
-                    # Create fresh network copy
+                repeats = []
+                for _ in range(max(1, n_repeats)):
                     net_copy = self._copy_network()
-                    
-                    # Apply scenario
-                    self._apply_scenario(net_copy, scenario)
-                    
-                    # Solve optimization
-                    approach_kw = dict(approach_kwargs)
-                    # Set min_service_priority based on scenario if specified
-                    if 'min_service_priority' not in approach_kw:
-                        approach_kw['min_service_priority'] = []
-                    
-                    optimizer = AllocationOptimizer(network=net_copy, **approach_kw)
+                    from .uncertainty import apply_scenario
+                    apply_scenario(net_copy, scenario)
+
+                    kwargs = dict(approach_kwargs)
+                    kwargs.setdefault("min_service_priority", [])
+                    optimizer = AllocationOptimizer(network=net_copy, **kwargs)
                     solution = optimizer.solve()
-                    
-                    result = {
-                        'approach': approach_name,
-                        'scenario_index': scenario.get('scenario_type', 'unknown'),
-                        'allocations': solution or {},
-                        'scenario': scenario,
-                        'results': optimizer.get_results() if solution else {},
-                    }
-                    repeat_results.append(result)
-                
-                # Average the results across repeats
-                averaged = self._average_results(repeat_results)
-                approach_results.append(averaged)
-            
+                    repeats.append({
+                        "scenario_type": scenario.get("scenario_type", "unknown"),
+                        "allocations": (solution.get("allocations", {}) if solution else {}),
+                        "results": optimizer.get_results() if solution else {},
+                    })
+                approach_results.append(self._average_repeats(repeats))
             all_results[approach_name] = approach_results
             self.results[approach_name] = approach_results
-        
         return all_results
-    
-    def _average_results(self, results_list: List[Dict]) -> Dict:
-        """Average results across multiple repeats of the same scenario."""
-        if not results_list:
+
+    @staticmethod
+    def _average_repeats(repeats: List[Dict]) -> Dict:
+        if not repeats:
             return {}
-        
-        # Get the keys from the first result
-        first = results_list[0]
-        if not isinstance(first, dict):
-            return {}
-        
-        result = {}
-        for key in first.keys():
-            values = [r.get(key, np.nan) for r in results_list if isinstance(r.get(key), (int, float))]
-            if values:
-                result[key] = np.mean(values)
-            else:
-                result[key] = results_list[0].get(key)
-        
-        return result
-    
+        if len(repeats) == 1:
+            return dict(repeats[0])
 
-
-
+        merged: Dict = {"scenario_type": repeats[0].get("scenario_type"),
+                        "allocations": repeats[0].get("allocations", {})}
+        metric_dicts = [r.get("results", {}) for r in repeats]
+        keys = set().union(*[set(d) for d in metric_dicts]) if metric_dicts else set()
+        averaged = {}
+        for key in keys:
+            vals = [d[key] for d in metric_dicts if isinstance(d.get(key), (int, float))]
+            averaged[key] = float(np.mean(vals)) if vals else metric_dicts[0].get(key)
+        merged["results"] = averaged
+        return merged
 
     def export_results_csv(self, results: Dict[str, List[Dict]], filepath: str) -> None:
-        """Export experiment results to CSV format.
-        
-        Each row corresponds to one repeat of one approach on one scenario.
-        The results dict is keyed by approach name, with values being lists
-        of repeat results.
-        
-        Columns: approach, scenario_index, community_id, allocation_1, allocation_2,
-                 ..., demand, shortage, fairness, delivery_cost, objective_value, status, solver.
-        """
         import csv
         if not results:
             return
-        
-        # Collect all community IDs across all approaches
         all_communities = set()
         for approach_result in results.values():
             for r in approach_result:
-                alloc = r.get('allocations', {}).get('allocations', {})
-                all_communities.update(alloc.keys())
-        
-        fieldnames = ['approach', 'scenario_index'] + [f'alloc_{c}' for c in sorted(all_communities)] + ['demand', 'shortage', 'fairness', 'delivery_cost', 'objective_value', 'status', 'solver']
-        
-        with open(filepath, 'w', newline='') as csvfile:
-            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                all_communities.update(r.get("allocations", {}).keys())
+        fields = (["approach", "scenario_type"]
+                  + [f"alloc_{c}" for c in sorted(all_communities)]
+                  + ["shortage", "fairness", "delivery_cost", "objective_value",
+                     "runtime", "status", "solver"])
+        with open(filepath, "w", newline="") as fh:
+            writer = csv.DictWriter(fh, fieldnames=fields)
             writer.writeheader()
-            
             for approach_name, approach_result in results.items():
                 for r in approach_result:
-                    alloc = r.get('allocations', {}).get('allocations', {})
-                    row = {
-                        'approach': approach_name,
-                        'scenario_index': r.get('scenario_index', 'unknown'),
-                    }
-                    # Add allocation for each community
-                    for c in sorted(all_communities):
-                        row[f'alloc_{c}'] = alloc.get(c, 0)
-                    # Add demand (average per community)
-                    total_demand = r.get('total_demand', 0)
-                    row['demand'] = total_demand / len(all_communities) if all_communities else 0
-                    # Add metrics
-                    row['shortage'] = r.get('shortage', 0)
-                    row['fairness'] = r.get('fairness', 0)
-                    row['delivery_cost'] = r.get('delivery_cost', 0)
-                    row['objective_value'] = r.get('objective_value', 0)
-                    row['status'] = r.get('status', 'unsolved')
-                    row['solver'] = r.get('solver', 'unknown')
-                    
+                    metrics = r.get("results", {})
+                    row = {"approach": approach_name,
+                           "scenario_type": r.get("scenario_type", "unknown")}
+                    for c in all_communities:
+                        row[f"alloc_{c}"] = r.get("allocations", {}).get(c, 0)
+                    for key in ("shortage", "fairness", "delivery_cost",
+                                "objective_value", "runtime", "status", "solver"):
+                        row[key] = metrics.get(key, "")
                     writer.writerow(row)
-    
+
     def export_results_json(self, results: Dict[str, List[Dict]], filepath: str) -> None:
-        """Export experiment results to JSON format.
-        
-        Structured for downstream analysis and visualization tools.
-        """
         import json
-        export_data = []
-        
+        export = []
         for approach_name, approach_result in results.items():
             for r in approach_result:
-                alloc = r.get('allocations', {}).get('allocations', {})
-                entry = {
-                    'approach': approach_name,
-                    'scenario_index': r.get('scenario_index', 'unknown'),
-                    'shortage': r.get('shortage', 0),
-                    'fairness': r.get('fairness', 0),
-                    'delivery_cost': r.get('delivery_cost', 0),
-                    'objective_value': r.get('objective_value', 0),
-                    'status': r.get('status', 'unsolved'),
-                    'solver': r.get('solver', 'unknown'),
-                    'allocations': alloc,
-                    'total_demand': r.get('total_demand', 0),
-                    'total_allocated': r.get('total_allocated', 0),
-                }
-                export_data.append(entry)
-        
-        with open(filepath, 'w') as jsonfile:
-            json.dump(export_data, jsonfile, indent=2)
-
-
+                metrics = r.get("results", {})
+                export.append({
+                    "approach": approach_name,
+                    "scenario_type": r.get("scenario_type", "unknown"),
+                    "allocations": r.get("allocations", {}),
+                    **{k: metrics.get(k) for k in
+                       ("shortage", "fairness", "delivery_cost", "objective_value",
+                        "total_demand", "total_allocated", "runtime", "status", "solver")},
+                })
+        with open(filepath, "w") as fh:
+            json.dump(export, fh, indent=2)
 
     def compute_summary_metrics(self) -> Dict:
-        """Compute summary comparison metrics across all approaches and scenarios."""
         summary = {}
-        
         for approach_name, approach_results in self.results.items():
-            if not approach_results:
+            rows = [r["results"] for r in approach_results
+                    if isinstance(r.get("results"), dict) and r["results"]]
+            if not rows:
                 continue
-            
-            # Extract key metrics per scenario
-            shortages = [r['results']['shortage'] for r in approach_results if r['results']]
-            fairness_vals = [r['results']['fairness'] for r in approach_results if r['results']]
-            costs = [r['results']['delivery_cost'] for r in approach_results if r['results']]
-            runtimes = [r['results'].get('runtime', 0) for r in approach_results if r['results']]
-            
+
+            def col(key):
+                return [row[key] for row in rows if isinstance(row.get(key), (int, float))]
+
+            shortages, fairness_vals, costs, runtimes = (
+                col("shortage"), col("fairness"), col("delivery_cost"), col("runtime"))
             summary[approach_name] = {
-                'avg_shortage': np.mean(shortages) if shortages else 0,
-                'worst_shortage': max(shortages) if shortages else 0,
-                'avg_fairness': np.mean(fairness_vals) if fairness_vals else 0,
-                'worst_fairness': max(fairness_vals) if fairness_vals else 0,
-                'avg_cost': np.mean(costs) if costs else 0,
-                'worst_cost': max(costs) if costs else 0,
-                'avg_runtime': np.mean(runtimes) if runtimes else 0,
-                'std_shortage': np.std(shortages) if len(shortages) > 1 else 0,
-                'std_fairness': np.std(fairness_vals) if len(fairness_vals) > 1 else 0,
-                'std_cost': np.std(costs) if len(costs) > 1 else 0,
-                'std_runtime': np.std(runtimes) if len(runtimes) > 1 else 0,
-                'feasibility_rate': sum(1 for r in approach_results if r['results'].get('shortage', 0) == 0) / len(approach_results),
-                'scenario_count': len(approach_results),
+                "avg_shortage": float(np.mean(shortages)) if shortages else 0.0,
+                "worst_shortage": max(shortages) if shortages else 0.0,
+                "avg_fairness": float(np.mean(fairness_vals)) if fairness_vals else 0.0,
+                "worst_fairness": max(fairness_vals) if fairness_vals else 0.0,
+                "avg_cost": float(np.mean(costs)) if costs else 0.0,
+                "worst_cost": max(costs) if costs else 0.0,
+                "avg_runtime": float(np.mean(runtimes)) if runtimes else 0.0,
+                "std_shortage": float(np.std(shortages)) if len(shortages) > 1 else 0.0,
+                "std_fairness": float(np.std(fairness_vals)) if len(fairness_vals) > 1 else 0.0,
+                "std_cost": float(np.std(costs)) if len(costs) > 1 else 0.0,
+                "feasibility_rate": (sum(1 for s in shortages if s == 0) / len(rows)) if rows else 0.0,
+                "scenario_count": len(rows),
             }
-        
         return summary
-    
-    def statistical_significance(self, metric: str = 'shortage',
-                                   approach_a: str = None, approach_b: str = None) -> Optional[Dict]:
-        """Perform paired t-test comparing two approaches on a given metric.
-        
-        Returns dict with t-statistic, p-value, and interpretation.
-        """
+
+    def statistical_significance(self, metric: str = "shortage",
+                                 approach_a: Optional[str] = None,
+                                 approach_b: Optional[str] = None) -> Optional[Dict]:
         if approach_a not in self.results or approach_b not in self.results:
             return None
-        
-        results_a = self.results[approach_a]
-        results_b = self.results[approach_b]
-        
-        # Match by scenario index
-        n = min(len(results_a), len(results_b))
+        a, b = self.results[approach_a], self.results[approach_b]
+        n = min(len(a), len(b))
         if n < 2:
             return None
-        
-        metric_a = [results_a[i]['results'].get(metric, 0) for i in range(n)]
-        metric_b = [results_b[i]['results'].get(metric, 0) for i in range(n)]
-        
-        # Paired t-test
-        diffs = [a - b for a, b in zip(metric_a, metric_b)]
-        mean_diff = np.mean(diffs)
-        std_diff = np.std(diffs, ddof=1) if len(diffs) > 1 else 0
-        
+        ma = [a[i]["results"].get(metric, 0.0) for i in range(n)]
+        mb = [b[i]["results"].get(metric, 0.0) for i in range(n)]
+        diffs = [x - y for x, y in zip(ma, mb)]
+        mean_diff = float(np.mean(diffs))
+        std_diff = float(np.std(diffs, ddof=1)) if len(diffs) > 1 else 0.0
         if std_diff == 0:
+            t_stat = 0.0 if mean_diff == 0 else float("inf")
             p_value = 1.0
-            t_stat = 0.0 if mean_diff == 0 else float('inf')
         else:
             t_stat = mean_diff / (std_diff / np.sqrt(n))
-            # Two-sided p-value approximation
-            from scipy import stats
-            p_value = 2 * (1 - stats.t.cdf(abs(t_stat), df=n-1))
-        
+            try:
+                from scipy import stats
+                p_value = float(2 * (1 - stats.t.cdf(abs(t_stat), df=n - 1)))
+            except Exception:
+                p_value = float("nan")
         return {
-            't_statistic': t_stat,
-            'p_value': p_value,
-            'mean_difference': mean_diff,
-            'significant': p_value < 0.05,
-            'interpretation': f"{approach_a} {'better' if mean_diff < 0 else 'worse'} than {approach_b}" if p_value < 0.05 else "No significant difference"
+            "t_statistic": t_stat,
+            "p_value": p_value,
+            "mean_difference": mean_diff,
+            "significant": bool(p_value < 0.05),
+            "interpretation": (
+                f"{approach_a} {'better' if mean_diff < 0 else 'worse'} than {approach_b}"
+                if p_value < 0.05 else "No significant difference"),
         }
-    
-    def sensitivity_analysis(self, metric: str = 'shortage',
-                             approach: str = None, param: str = 'alpha',
-                             values: Optional[List[float]] = None) -> Dict:
-        """Analyze how varying a parameter affects the given metric.
-        
-        Parameters vary the specified optimizer parameter (alpha, beta, gamma)
-        and report the resulting metric values.
-        """
-        if approach not in self.results:
+
+    def sensitivity_analysis(self, metric: str = "shortage", approach: Optional[str] = None,
+                             param: str = "alpha", values: Optional[List[float]] = None) -> Dict:
+        matching = [kw for name, kw in self.approaches if name == approach]
+        if not matching:
             return {}
-        
+        base = matching[0].get(param, 1.0)
         if values is None:
-            # Default range based on the approach's current value
-            matching = [kwargs for name, kwargs in self.approaches if name == approach]
-            if not matching:
-                return {}
-            approach_kw = matching[0]
-            base_val = approach_kw.get(param, 1.0)
-            values = [base_val * v for v in [0.5, 1.0, 1.5, 2.0]]
-        
-        results = {}
+            values = [base * v for v in (0.5, 1.0, 1.5, 2.0)]
+
+        out = {}
         for val in values:
-            # Temporarily set the parameter
-            matching = [kwargs for name, kwargs in self.approaches if name == approach]
-            if not matching:
-                return {}
-            approach_kw = dict(matching[0])
-            approach_kw[param] = float(val)
-            
-            # Run a single scenario to evaluate
-            scenario = self.scenarios[0] if self.scenarios else {}
+            kwargs = dict(matching[0])
+            kwargs[param] = float(val)
             net_copy = self._copy_network()
-            self._apply_scenario(net_copy, scenario)
-            
-            optimizer = AllocationOptimizer(network=net_copy, **approach_kw)
+            from .uncertainty import apply_scenario
+            apply_scenario(net_copy, self.scenarios[0] if self.scenarios else {})
+            optimizer = AllocationOptimizer(network=net_copy, **kwargs)
             solution = optimizer.solve()
-            results_val = optimizer.get_results() if solution else {}
-            
-            results[float(val)] = results_val.get(metric, float('nan'))
-        
-        return results
+            out[float(val)] = (optimizer.get_results().get(metric)
+                               if solution else float("nan"))
+        return out
 
 
 def compare_approaches(network: WaterNetwork,
                        approaches: Optional[List[Tuple[str, Dict]]] = None,
-                       scenarios: Optional[List[Dict]] = None) -> EvaluationSuite:
-    """Convenience function to run a full comparison evaluation."""
-    suite = EvaluationSuite(network, approaches=approaches, scenarios=scenarios)
+                       scenarios: Optional[List[Dict]] = None,
+                       seed: int = 42) -> EvaluationSuite:
+    suite = EvaluationSuite(network, approaches=approaches, scenarios=scenarios, seed=seed)
     suite.run_comparison()
     return suite
