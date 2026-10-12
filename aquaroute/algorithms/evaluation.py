@@ -30,25 +30,39 @@ class EvaluationSuite:
         AquaRoute candidate: Minimum-service-weighted optimization
         """
         return [
-            # Baseline A: Standard shortage-minimizing optimization
+# Baseline A: Shortage-minimizing optimization
+            # Objective: minimize total unmet demand only (alpha=1, beta=0, gamma=0).
+            # No consideration of fairness or delivery costs.
             ("baseline_A_shortage_minimizing", {
                 'alpha': 1.0, 'beta': 0.0, 'gamma': 0.0,
                 'min_service_priority': [],
                 'min_allocation': 0.0
             }),
-            # Baseline B: Demand-priority allocation
-            ("baseline_B_demand_priority", {
-                'alpha': 1.0, 'beta': 0.0, 'gamma': 0.0,
+            # Baseline B: Shortage + fairness optimization
+            # Objective: balance total unmet demand and allocation fairness (alpha=1, beta=1, gamma=0).
+            # Delivery cost is ignored; allocations trade off between demand satisfaction and
+            # proportional equity across communities.
+            ("baseline_B_shortage_fairness", {
+                'alpha': 1.0, 'beta': 1.0, 'gamma': 0.0,
                 'min_service_priority': [],
                 'min_allocation': 0.0
             }),
             # Baseline C: Fairness-aware optimization
+            # Objective: weighted combination with strong fairness emphasis (alpha=0.5, beta=2.0, gamma=1.0).
+            # Fairness is given twice the weight of delivery cost and half the weight of shortage,
+            # reflecting a policy choice to prioritize equitable proportional delivery even at the
+            # cost of some unmet demand.
             ("baseline_C_fairness_aware", {
                 'alpha': 0.5, 'beta': 2.0, 'gamma': 1.0,
                 'min_service_priority': [],
                 'min_allocation': 0.0
             }),
             # AquaRoute candidate: Minimum-service-weighted optimization
+            # Objective: balanced weights (alpha=1.0, beta=1.0, gamma=1.0) with minimum-service
+            # guarantees for priority communities. The distinguishing feature is not just the
+            # weight vector but the capability to enforce min_service_priority constraints, ensuring
+            # that communities flagged as priority receive at least min_allocation before secondary
+            # objectives are optimized, per lexicographic priority.
             ("aquaroute_min_service", {
                 'alpha': 1.0, 'beta': 1.0, 'gamma': 1.0,
                 'min_service_priority': [],
@@ -159,6 +173,91 @@ class EvaluationSuite:
         
         return result
     
+
+
+
+
+    def export_results_csv(self, results: Dict[str, List[Dict]], filepath: str) -> None:
+        """Export experiment results to CSV format.
+        
+        Each row corresponds to one repeat of one approach on one scenario.
+        The results dict is keyed by approach name, with values being lists
+        of repeat results.
+        
+        Columns: approach, scenario_index, community_id, allocation_1, allocation_2,
+                 ..., demand, shortage, fairness, delivery_cost, objective_value, status, solver.
+        """
+        import csv
+        if not results:
+            return
+        
+        # Collect all community IDs across all approaches
+        all_communities = set()
+        for approach_result in results.values():
+            for r in approach_result:
+                alloc = r.get('allocations', {}).get('allocations', {})
+                all_communities.update(alloc.keys())
+        
+        fieldnames = ['approach', 'scenario_index'] + [f'alloc_{c}' for c in sorted(all_communities)] + ['demand', 'shortage', 'fairness', 'delivery_cost', 'objective_value', 'status', 'solver']
+        
+        with open(filepath, 'w', newline='') as csvfile:
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            writer.writeheader()
+            
+            for approach_name, approach_result in results.items():
+                for r in approach_result:
+                    alloc = r.get('allocations', {}).get('allocations', {})
+                    row = {
+                        'approach': approach_name,
+                        'scenario_index': r.get('scenario_index', 'unknown'),
+                    }
+                    # Add allocation for each community
+                    for c in sorted(all_communities):
+                        row[f'alloc_{c}'] = alloc.get(c, 0)
+                    # Add demand (average per community)
+                    total_demand = r.get('total_demand', 0)
+                    row['demand'] = total_demand / len(all_communities) if all_communities else 0
+                    # Add metrics
+                    row['shortage'] = r.get('shortage', 0)
+                    row['fairness'] = r.get('fairness', 0)
+                    row['delivery_cost'] = r.get('delivery_cost', 0)
+                    row['objective_value'] = r.get('objective_value', 0)
+                    row['status'] = r.get('status', 'unsolved')
+                    row['solver'] = r.get('solver', 'unknown')
+                    
+                    writer.writerow(row)
+    
+    def export_results_json(self, results: Dict[str, List[Dict]], filepath: str) -> None:
+        """Export experiment results to JSON format.
+        
+        Structured for downstream analysis and visualization tools.
+        """
+        import json
+        export_data = []
+        
+        for approach_name, approach_result in results.items():
+            for r in approach_result:
+                alloc = r.get('allocations', {}).get('allocations', {})
+                entry = {
+                    'approach': approach_name,
+                    'scenario_index': r.get('scenario_index', 'unknown'),
+                    'shortage': r.get('shortage', 0),
+                    'fairness': r.get('fairness', 0),
+                    'delivery_cost': r.get('delivery_cost', 0),
+                    'objective_value': r.get('objective_value', 0),
+                    'status': r.get('status', 'unsolved'),
+                    'solver': r.get('solver', 'unknown'),
+                    'allocations': alloc,
+                    'total_demand': r.get('total_demand', 0),
+                    'total_allocated': r.get('total_allocated', 0),
+                }
+                export_data.append(entry)
+        
+        with open(filepath, 'w') as jsonfile:
+            json.dump(export_data, jsonfile, indent=2)
+
+
+
     def compute_summary_metrics(self) -> Dict:
         """Compute summary comparison metrics across all approaches and scenarios."""
         summary = {}

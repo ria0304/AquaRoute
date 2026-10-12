@@ -81,6 +81,93 @@ class WaterNetwork:
         return True
 
 
+    @classmethod
+    def from_dict(cls, data: Dict) -> 'WaterNetwork':
+        """Construct a WaterNetwork from a dict description.
+
+        Supported dict keys:
+          - 'reservoirs': list of dicts with 'node_id', 'capacity', 'supply'
+          - 'communities': list of dicts with 'node_id', 'demand', 'priority'
+          - 'pipelines': list of dicts with 'from_node', 'to_node', 'capacity', 'delivery_cost'
+
+        Example:
+            net = WaterNetwork.from_dict({
+                'reservoirs': [{'node_id': 0, 'capacity': 100.0, 'supply': 100.0}],
+                'communities': [{'node_id': 1, 'demand': 50.0, 'priority': 1}],
+                'pipelines': [{'from_node': 0, 'to_node': 1, 'capacity': 60.0, 'delivery_cost': 2.0}],
+            })
+        """
+        net = cls()
+
+        # Add reservoirs
+        for r in data.get('reservoirs', []):
+            node_id = r['node_id']
+            net.add_reservoir(node_id=node_id, capacity=r['capacity'], supply=r['supply'])
+
+        # Add communities
+        for c in data.get('communities', []):
+            node_id = c['node_id']
+            net.add_community(node_id=node_id, demand=c['demand'], priority=c.get('priority', 0))
+
+        # Add pipelines
+        for p in data.get('pipelines', []):
+            net.add_pipeline(from_node=p['from_node'], to_node=p['to_node'],
+                           capacity=p['capacity'], delivery_cost=p.get('delivery_cost', 1.0))
+
+        return net
+
+    @classmethod
+    def from_epanet_style(cls, nodes: Dict, edges: List[Dict]) -> 'WaterNetwork':
+        """Construct a WaterNetwork from EPANET-style node and edge data.
+
+        Parameters
+        ----------
+        nodes : dict
+            Mapping of node_id -> dict with keys:
+              - 'type': 'reservoir' or 'community'
+              - For reservoirs: 'capacity', 'supply'
+              - For communities: 'demand', 'priority' (optional)
+        edges : list of dict
+            Each dict should have:
+              - 'from_node': int
+              - 'to_node': int
+              - 'capacity': float (optional, defaults to infinity)
+              - 'delivery_cost': float (optional, defaults to 1.0)
+
+        Returns
+        -------
+        WaterNetwork
+            The constructed network structure. Full EPANET hydraulic validation
+            requires the WNTR package, which is not currently installed.
+        """
+        net = cls()
+
+        # Add all nodes
+        for node_id, node_data in nodes.items():
+            node_type = node_data.get('type', 'community')
+            if node_type == 'reservoir':
+                cap = node_data.get('capacity', float('inf'))
+                sup = node_data.get('supply', float('inf'))
+                net.add_reservoir(node_id=node_id, capacity=cap, supply=sup)
+            elif node_type == 'community':
+                dem = node_data.get('demand', 0.0)
+                prio = node_data.get('priority', 0)
+                net.add_community(node_id=node_id, demand=dem, priority=prio)
+            else:
+                raise ValueError(f"Unknown node type '{node_type}' in EPANET-style data")
+
+        # Add all edges
+        for edge in edges:
+            u = edge['from_node']
+            v = edge['to_node']
+            cap = edge.get('capacity', float('inf'))
+            cost = edge.get('delivery_cost', 1.0)
+            net.add_pipeline(from_node=u, to_node=v, capacity=cap, delivery_cost=cost)
+
+        return net
+
+
+
 def create_sample_network() -> WaterNetwork:
     """Create a sample water distribution network for demonstration.
     

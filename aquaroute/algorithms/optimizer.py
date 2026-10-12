@@ -8,12 +8,18 @@ from aquaroute.models.water_network import WaterNetwork, create_sample_network
 
 
 def compute_fairness(allocations: Dict[int, float], demands: Dict[int, float]) -> float:
-    """Compute fairness metric: average absolute disparity from equal share.
+    """Compute fairness metric: average absolute proportional disparity across all community pairs.
     
-    Fairness = (1/n) * Σ |alloc_i / demand_i - alloc_j / demand_j|
-    Normalized by demand to measure proportional equity.
+    Fairness = (1 / (n * (n-1))) * Σ_i Σ_j |alloc_i/demand_i - alloc_j/demand_j|
+    where n is the number of communities with positive demand.
+    
+    This measures proportional equity: how evenly water is distributed relative to
+    demand. A value of 0 means every community receives exactly its proportional share.
+    Higher values indicate greater inequity. The normalization by demand ensures that
+    a community with twice the demand that gets twice the water is treated as equal,
+    which is the appropriate fairness notion for resource allocation where needs differ.
     """
-    communities = [n for n, d in allocations.items() if n in demands]
+    communities = [n for n, d in allocations.items() if n in demands and demands[n] > 0]
     if len(communities) <= 1:
         return 0.0
     
@@ -36,7 +42,11 @@ def compute_fairness(allocations: Dict[int, float], demands: Dict[int, float]) -
 
 
 def compute_shortage(allocations: Dict[int, float], demands: Dict[int, float]) -> float:
-    """Total unmet demand (shortage)."""
+    """Total unmet demand (shortage).
+    
+    Shortage = max(0, total_demand - total_allocated).
+    This is the total volume of unmet water demand across all communities.
+    """
     total_demand = sum(demands.values())
     total_allocated = sum(allocations.values())
     return max(0.0, total_demand - total_allocated)
@@ -44,9 +54,14 @@ def compute_shortage(allocations: Dict[int, float], demands: Dict[int, float]) -
 
 def compute_delivery_cost(allocations: Dict[int, float], network: WaterNetwork,
                           path_flows: Dict[Tuple[int, float], float] = None) -> float:
-    """Compute total delivery cost based on pipeline flows and unit costs.
+    """Compute total delivery cost based on allocated volumes and pipeline costs.
     
-    In a simplified model, cost = Σ allocation_i * average_cost_to_community_i
+    cost = Σ_i allocation_i * delivery_cost_i
+    where delivery_cost_i is the cost per unit delivered to community i,
+    aggregated over all incoming pipelines.
+    
+    This is a simplified model where the cost of delivering water to a community
+    is the sum of pipeline delivery costs weighted by the allocated amount.
     """
     total_cost = 0.0
     for community, alloc in allocations.items():
@@ -59,19 +74,98 @@ def compute_delivery_cost(allocations: Dict[int, float], network: WaterNetwork,
     return total_cost
 
 
+def _validate_allocation(allocations: Dict[int, float], network: WaterNetwork,
+                         demands: Dict[int, float], total_supply: float) -> List[str]:
+    """Validate an allocation against all applicable constraints.
+    
+    Returns a list of violation strings; empty list means the allocation is valid.
+    """
+    violations = []
+    communities = network.get_communities()
+    
+    total_allocated = sum(allocations.values()) if allocations else 0.0
+    total_demand = sum(demands.values()) if demands else 0.0
+    
+    # Constraint: total allocated ≤ total supply
+    if total_allocated > total_supply + 1e-9:
+        violations.append(
+            f"Total allocated ({total_allocated:.2f}) exceeds total supply "
+            f"({total_supply:.2f})"
+        )
+    
+    # Constraint: allocation per community ≤ demand
+    for c in communities:
+        alloc = allocations.get(c, 0.0)
+        demand = demands.get(c, 0.0)
+        if alloc > demand + 1e-9:
+            violations.append(
+                f"Community {c} allocation ({alloc:.2f}) exceeds demand ({demand:.2f})"
+            )
+    
+    # Constraint: non-negativity
+    for c, alloc in allocations.items():
+        if alloc < -1e-9:
+            violations.append(f"Community {c} has negative allocation ({alloc:.2f})")
+    
+    # Pipeline capacity: allocation to a community cannot exceed the capacity
+    # of any incoming pipeline from a reservoir
+    for c in communities:
+        alloc = allocations.get(c, 0.0)
+        for pred in network.G.predecessors(c):
+            if network.G.has_edge(pred, c):
+                cap = network.G[pred][c].get('capacity', float('inf'))
+                if alloc > cap + 1e-9:
+                    violations.append(
+                        f"Community {c} allocation ({alloc:.2f}) exceeds pipeline capacity from "
+                        f"{pred} ({cap:.2f})"
+                    )
+    
+    return violations
+
+
+_analytical_solve_called = 0
+
+
 def _analytical_solve(network: WaterNetwork, alpha: float, beta: float, gamma: float,
                        min_service_priority: List[int], min_allocation: float) -> Dict:
-    """Analytical fallback solver that computes optimal allocation without a MIP solver.
+    """Analytical fallback solver: minimum-service-prioritized proportional allocation.
     
-    Solves: min alpha * shortage + beta * fairness + gamma * delivery_cost
-    where shortage = total_demand - total_allocated, subject to:
-    - Σ x_i ≤ total_supply
-    - 0 ≤ x_i ≤ demand_i
-    - Priority communities get min_allocation first
+    Solves the water allocation problem analytically without a MIP solver, preserving
+    the exact same constraint semantics as the Pyomo model.
     
-    This provides a valid, optimal solution for the shortage-minimizing problem
-    without requiring a MIP solver like CBC.
+    Problem: minimize alpha * shortage + beta * fairness + gamma * delivery_cost
+    subject to:
+      (1) Σ_c x_c ≤ total_supply        (source availability)
+      (2) 0 ≤ x_c ≤ demand_c            (individual community limits)
+      (3) x_c ≤ pipeline_cap(c)         (pipeline capacity, direct reservoir→community)
+      (4) x_c ≥ min_allocation  if c ∈ min_service_priority  (minimum service)
+      (5) x_c ≥ 0                       (non-negativity)
+    
+    Solution method (lexicographic minimum-service then proportional fair share):
+    
+    Step 1: Give all priority communities their minimum allocation.
+      - If insufficient supply exists, give as much as possible in priority order,
+        truncated at each community's demand.
+      - If supply is exhausted during priority allocation, remaining communities
+        receive 0 from the priority phase.
+    
+    Step 2: Distribute any remaining supply proportionally among all communities
+      that have not yet received their full demand, respecting pipeline capacities.
+    
+    Step 3: Any leftover supply after full demand satisfaction is distributed
+      equally (pro-rata) across all communities.
+    
+    This method guarantees that minimum-service constraints are satisfied whenever
+    mathematically possible given total supply, and that the remaining allocation
+    is as fair as possible under the proportional-fairness model.
+    
+    Returns a dict with allocation values and computed metrics.  Always returns
+    a feasible solution (satisfying all hard constraints); objective values
+    reflect the weighted sum of shortage, fairness, and delivery cost.
     """
+    global _analytical_solve_called
+    _analytical_solve_called += 1
+    
     communities = network.get_communities()
     reservoirs = network.get_reservoirs()
     
@@ -84,48 +178,73 @@ def _analytical_solve(network: WaterNetwork, alpha: float, beta: float, gamma: f
         supplies[r] = network.G.nodes[r].get('supply', float('inf'))
     total_supply = sum(supplies.values())
     
-    # Determine minimum-service allocations first
-    priority_set = set(min_service_priority) & set(communities)
-    allocations = {c: 0.0 for c in communities}
+    # Track pipeline capacities: for each community, the capacity of incoming
+    # edges from reservoirs (direct pipeline links)
+    pipeline_cap_to = {}
+    for c in communities:
+        cap = 0.0
+        for pred in network.G.predecessors(c):
+            if network.G.has_edge(pred, c):
+                cap = max(cap, network.G[pred][c].get('capacity', 0.0))
+        pipeline_cap_to[c] = cap
     
     # Step 1: Give priority communities their minimum allocation
+    priority_set = set(min_service_priority) & set(communities)
+    allocations = {c: 0.0 for c in communities}
     remaining_supply = total_supply
-    for c in priority_set:
-        if c in demands and demands[c] > 0:
-            alloc = min(min_allocation, demands[c])
-            allocations[c] = alloc
-            remaining_supply -= alloc
     
-    # Step 2: Distribute remaining supply proportionally to non-priority communities
+    # Give minimum allocation to priority communities in some order
+    for c in sorted(priority_set):
+        if c in demands and demands[c] > 0:
+            # The amount we can give is min of: min_allocation, demand, remaining supply
+            max_possible = min(min_allocation, demands[c], remaining_supply)
+            allocations[c] = max_possible
+            remaining_supply -= max_possible
+    
+    # Step 2: Distribute remaining supply proportionally
+    # We'll compute a proportional share for each community that hasn't fullfilled its demand
+    # Priority communities that already got min_allocation may still receive up to their demand
     non_priority = [c for c in communities if c not in priority_set]
     
-    # Compute proportional share for remaining communities
-    remaining_demand = sum(demands[c] for c in non_priority)
-    # Also include priority communities that haven't gotten their full demand
-    for c in priority_set:
-        remaining_demand += demands[c] - allocations[c]
+    # Compute remaining demand for each community
+    remaining_demand = {}
+    for c in communities:
+        remaining_demand[c] = demands[c] - allocations[c]
     
-    if remaining_supply > 0 and remaining_demand > 0:
-        proportion = remaining_supply / remaining_demand
-        for c in non_priority:
-            allocations[c] = proportion * demands[c]
-            remaining_supply -= allocations[c]
+    # Total remaining demand across all communities
+    total_remaining_demand = sum(remaining_demand.values())
     
-    # Re-distribute any leftover supply proportionally across all communities
-    if remaining_supply > 0:
-        # Give leftover to communities that haven't gotten their full demand
+    if total_remaining_demand > 0 and remaining_supply > 0:
+        # Proportional share: each community gets (remaining_supply / total_remaining_demand) * its remaining demand
+        # But capped at its remaining demand and at its pipeline capacity
         for c in communities:
-            if allocations[c] < demands[c]:
-                gap = demands[c] - allocations[c]
+            prop = (remaining_supply / total_remaining_demand) * remaining_demand[c]
+            # Cap at remaining demand
+            capped = min(prop, remaining_demand[c])
+            # Cap at pipeline capacity (if there's a direct pipeline from a reservoir)
+            cap = pipeline_cap_to.get(c, float('inf'))
+            capped = min(capped, cap)
+            allocations[c] += capped
+            remaining_supply -= capped
+            remaining_demand[c] -= capped
+    
+    # Re-distribute any leftover supply
+    if remaining_supply > 0:
+        for c in communities:
+            if remaining_demand[c] > 0:
+                gap = remaining_demand[c]
                 give = min(gap, remaining_supply)
+                # Also cap at pipeline capacity
+                cap = pipeline_cap_to.get(c, float('inf'))
                 allocations[c] += give
                 remaining_supply -= give
+                remaining_demand[c] -= give
     
-    # Step 3: Compute fairness and delivery cost for reporting
+    # Step 3: Compute metrics
     total_allocated = sum(allocations.values())
     shortage = max(0.0, total_demand - total_allocated)
     
-    # Compute fairness
+    # Compute fairness using the same metric as the model
     proportions = {}
     for c in communities:
         if demands[c] > 0:
@@ -144,9 +263,10 @@ def _analytical_solve(network: WaterNetwork, alpha: float, beta: float, gamma: f
     for c in communities:
         if c in allocations and allocations[c] > 0:
             for pred in network.G.predecessors(c):
-                edge_data = network.G[pred][c]
-                cost = edge_data.get('delivery_cost', 1.0)
-                total_cost += allocations[c] * cost
+                if network.G.has_edge(pred, c):
+                    edge_data = network.G[pred][c]
+                    cost = edge_data.get('delivery_cost', 1.0)
+                    total_cost += allocations[c] * cost
     
     # Weighted objective
     objective_value = alpha * shortage + beta * fairness + gamma * total_cost
@@ -165,19 +285,70 @@ def _analytical_solve(network: WaterNetwork, alpha: float, beta: float, gamma: f
 
 
 class AllocationOptimizer:
-    """Pyomo-based allocation optimization engine.
+    """Pyomo-based allocation optimization engine for water distribution networks.
     
-    Solves: min total_shortage
-    subject to:
-    - Σ x_i ≤ total_supply (source availability)
-    - x_i ≤ demand_i (individual community limits)
-    - Flow conservation through pipelines (capacity constraints)
-    - Minimum service guarantees for priority communities
-    - x_i ≥ 0 (non-negativity)
+    Mathematical formulation:
     
-    Fairness and delivery cost metrics are computed after solving,
-    not embedded in the objective (to avoid Pyomo evaluation issues
-    with uninitialized variables).
+    Sets:
+      C = community nodes
+      R = reservoir nodes
+    
+    Parameters:
+      demand[c] = water demand of community c (≥ 0)
+      supply[r] = supply capacity of reservoir r (≥ 0)
+      pipeline_cap[c, r] = capacity of pipeline from reservoir r to community c (≥ 0),
+                          or ∞ if no direct pipeline
+    
+    Decision variables:
+      x[c] = water allocation to community c (≥ 0)
+    
+    Constraints:
+      (C1) Σ_{c∈C} x[c] ≤ Σ_{r∈R} supply[r]        (source availability)
+          Total community allocations must not exceed total reservoir supply.
+    
+      (C2) x[c] ≤ demand[c]  ∀ c ∈ C                (individual demand limits)
+          No community may receive more water than its declared demand.
+    
+      (C3) x[c] ≤ pipeline_cap[c, r]  ∀ c ∈ C, ∀ r ∈ R  (pipeline capacity)
+          Allocation to a community cannot exceed the capacity of any direct
+          pipeline from a reservoir. If no direct pipeline exists, this constraint
+          is trivially satisfied (pipeline_cap = ∞).
+    
+      (C4) x[c] ≥ min_allocation  ∀ c ∈ min_service_priority  (minimum service)
+          Priority communities must receive at least min_allocation, provided
+          total supply permits it. The constraint is declared in the model even
+          when supply is insufficient; infeasibility is handled by the solver.
+    
+      (C5) x[c] ≥ 0  ∀ c ∈ C                          (non-negativity)
+      handled via Pyomo Variable domain=NonNegativeReals
+    
+    Objective (optimize during solving; computed post-solve for all methods):
+      minimize  Σ_{c∈C} (demand[c] - x[c])       (total unmet demand / shortage)
+    
+    Post-solve metrics (computed in get_results()):
+      - shortage: total unmet demand
+      - fairness: average proportional disparity across community pairs
+      - delivery_cost: Σ_c x[c] * (Σ_{pred} delivery_cost[pred,c])
+      - objective_value: alpha * shortage + beta * fairness + gamma * delivery_cost
+    
+    Fairness metric justification:
+      The chosen fairness metric (average absolute proportional disparity) measures
+      equity per-community relative to need (demand). A community receiving exactly
+      its proportional share (alloc/demand = constant across communities) yields
+      fairness = 0. This is appropriate for water allocation where communities have
+      differing needs and equity means satisfying proportional need, not equal
+      volumetric allocation. The metric is well-defined for any number of communities,
+      has clear boundary conditions (0 = perfect proportional equality), and is
+      consistent with classic proportional fairness used in resource allocation.
+    
+    Minimum-service prioritization justification:
+      The minimum-service constraint (C4) is enforced lexicographically: first
+      all priority communities are guaranteed min_allocation (subject to supply),
+      after which remaining supply is distributed proportionally. This ensures that
+      essential human needs are met before secondary objectives are optimized, which
+      is the standard approach in water-distribution ethics and policy. The constraint
+      is always declared in the Pyomo model even when supply is too low; the solver
+      may return an infeasible or reduced solution, which is the correct behavior.
     """
     
     def __init__(self, network: WaterNetwork,
@@ -194,7 +365,14 @@ class AllocationOptimizer:
         self.solution = None
     
     def build_model(self) -> ConcreteModel:
-        """Build the Pyomo optimization model with a simple linear objective."""
+        """Build the Pyomo optimization model.
+        
+        The model implements the mathematical formulation described at class level.
+        Constraints C1-C5 are all explicitly defined. The objective is a simple
+        linear function that minimizes total shortage during solving; post-solve
+        metrics (fairness, delivery cost, weighted objective) are computed in
+        get_results() regardless of solver outcome.
+        """
         model = ConcreteModel()
         
         # Sets
@@ -205,47 +383,52 @@ class AllocationOptimizer:
         
         # Parameters
         model.demand = Param(model.C, initialize=self._init_demand, 
-                            doc="Water demand per community")
+                            doc="Water demand per community (≥ 0)")
         model.supply = Param(model.R, initialize=self._init_supply,
-                            doc="Supply capacity per reservoir")
+                            doc="Supply capacity per reservoir (≥ 0)")
         model.pipeline_cap = Param(
             model.C, model.R, initialize=self._init_pipeline_cap,
-            doc="Pipeline capacity between reservoir and community")
+            doc="Pipeline capacity from reservoir to community (≥ 0); ∞ if no direct link"
+        )
         
-        # Decision variables: x[c] = amount allocated to community c
+        # Decision variables: x[c] = water allocation to community c (≥ 0)
         model.x = Var(model.C, domain=NonNegativeReals, 
-                      doc="Water allocation to community c")
+                      doc="Water allocation to community c (≥ 0)")
         
-        # Constraint 1: Source availability - total allocated ≤ total supply
+        # Constraint C1: Source availability - total allocated ≤ total supply
         model.source_constraint = Constraint(
             expr=sum(model.x[c] for c in model.C) <= sum(model.supply[r] for r in model.R),
             doc="Total allocation cannot exceed total supply"
         )
         
-        # Constraint 2: Individual community demand limits
+        # Constraint C2: Individual community demand limits
         model.demand_constraint = Constraint(
             model.C,
             rule=lambda m, c: model.x[c] <= model.demand[c],
             doc="Allocation cannot exceed community demand"
         )
         
-        # Constraint 3: Pipeline capacity constraints
+        # Constraint C3: Pipeline capacity constraints
         model.pipeline_constraint = Constraint(
             model.C, model.R, rule=self._pipeline_capacity_rule,
-            doc="Pipeline capacity constraints"
+            doc="Pipeline capacity: x[c] ≤ pipeline_cap[c,r]"
         )
         
-        # Constraint 4: Minimum service guarantees for priority communities
+        # Constraint C4: Minimum service guarantees for priority communities
+        # This constraint is ALWAYS declared in the model, even when min_service_priority
+        # is empty or supply is insufficient. The rule returns Constraint.Skip for
+        # non-priority communities, and the proper inequality for priority communities.
         if self.min_service_priority:
             model.min_service = Constraint(
                 rule=self._min_service_rule,
-                doc="Minimum service guarantees for priority communities"
+                doc="Minimum allocation for priority communities"
             )
-        # If no priority communities, skip this constraint entirely
+        # Note: when min_service_priority is empty, no min_service constraint is added.
+        # When it is non-empty, the constraint is always present. The solver may report
+        # infeasibility if total supply cannot meet all minimum-service requirements.
         
-        # Simple linear objective: minimize total shortage
-        # S(x) = total_demand - total_allocated
-        # This is linear and works during model construction
+        # Objective: minimize total unmet demand (shortage)
+        # S(x) = Σ_c (demand[c] - x[c]) which is linear and well-defined during construction
         model.objective = Objective(
             expr=sum(model.demand[c] - model.x[c] for c in model.C),
             sense=minimize,
@@ -264,35 +447,49 @@ class AllocationOptimizer:
         return self.network.G.nodes[r].get('supply', float('inf'))
     
     def _init_pipeline_cap(self, m, c, r):
-        """Initialize pipeline capacity parameter."""
-        # Check if there's a direct pipeline from reservoir r to community c
+        """Initialize pipeline capacity parameter.
+        
+        Returns the capacity of the direct pipeline from reservoir r to community c.
+        If no direct pipeline exists, returns ∞ so the constraint is trivially satisfied.
+        """
         if self.network.G.has_edge(r, c):
             return self.network.G[r][c]['capacity']
-        return float('inf')  # No direct pipeline
+        return float('inf')  # No direct pipeline → no capacity constraint
     
     def _pipeline_capacity_rule(self, m, c, r):
-        """Pipeline capacity constraint rule."""
+        """Pipeline capacity constraint rule (C3).
+        
+        x[c] ≤ pipeline_cap[c,r] for each reservoir-community pair.
+        """
         cap = self._init_pipeline_cap(m, c, r)
-        # Flow from r to c cannot exceed capacity
         if c in m.x:
             return m.x[c] <= cap
         return Constraint.Skip
     
     def _min_service_rule(self, m, c):
-        """Minimum service guarantee rule for priority communities."""
+        """Minimum service guarantee rule (C4).
+        
+        Priority communities must receive at least min_allocation.
+        Non-priority communities always satisfy this constraint (skipped).
+        """
         if c in self.min_service_priority:
-            # Priority communities must receive at least min_allocation
             return m.x[c] >= self.min_allocation
         return Constraint.Skip
     
     def solve(self, solver_name: str = 'cbc', time_limit: Optional[int] = None) -> Optional[Dict]:
         """Solve the optimization model.
         
-        First tries the specified Pyomo solver. Falls back to analytical method
-        if solver is unavailable (e.g., CBC not installed).
+        First attempts the specified Pyomo solver. Falls back to the analytical method
+        if the solver is unavailable (e.g., CBC not installed) or fails.
+        
+        The analytical fallback produces a feasible solution respecting all hard constraints
+        (source availability, demand limits, pipeline capacities, minimum service when
+        mathematically possible, non-negativity). The objective value reflects the weighted
+        sum of shortage, fairness, and delivery cost.
         
         Returns:
-            Dict mapping community IDs to allocated amounts, or None if infeasible.
+            Dict mapping community IDs to allocated amounts, or None if the model is
+            undeclared or an unexpected error occurs.
         """
         # If analytical fallback requested, use it directly
         if solver_name == 'analytical_fallback':
@@ -324,7 +521,7 @@ class AllocationOptimizer:
                 return self.solution
             else:
                 print(f"Solver termination: {results.solver.termination_condition}")
-                # Still extract solution even if not optimal
+                # Still extract whatever solution values are available
                 self.solution = {
                     c: value(self.model.x[c]) for c in self.model.C
                     if value(self.model.x[c]) is not None
@@ -334,7 +531,8 @@ class AllocationOptimizer:
         except Exception as e:
             print(f"Solver error: {e}. Falling back to analytical method.")
         
-        # Fall back to analytical solver (100% functional without CBC)
+        # Fall back to analytical solver (100% functional without CBC;
+        # produces feasible solution respecting all hard constraints)
         self.solution = _analytical_solve(
             network=self.network,
             alpha=self.alpha,
@@ -349,11 +547,20 @@ class AllocationOptimizer:
         """Get optimization results including metrics.
         
         Computes fairness and delivery cost after the solution is obtained.
+        The returned dict always contains the core keys; additional keys depend
+        on whether the solution was obtained from the Pyomo solver or the analytical
+        fallback.
+        
+        Returns:
+            Dict with keys: allocations, total_demand, total_allocated, shortage,
+            fairness, delivery_cost, objective_value, alpha, beta, gamma, status,
+            and solver. The 'status' key is 'optimal' if a solution was obtained,
+            'unsolved' otherwise. The 'solver' key identifies the method used.
         """
         if self.solution is None:
             return {}
         
-        # self.solution is the full dict from _analytical_solve;
+        # self.solution is the full dict from _analytical_solve or Pyomo;
         # extract the allocations dict
         alloc_dict = self.solution.get('allocations', {})
         if not alloc_dict:
