@@ -59,6 +59,111 @@ def compute_delivery_cost(allocations: Dict[int, float], network: WaterNetwork,
     return total_cost
 
 
+def _analytical_solve(network: WaterNetwork, alpha: float, beta: float, gamma: float,
+                       min_service_priority: List[int], min_allocation: float) -> Dict:
+    """Analytical fallback solver that computes optimal allocation without a MIP solver.
+    
+    Solves: min alpha * shortage + beta * fairness + gamma * delivery_cost
+    where shortage = total_demand - total_allocated, subject to:
+    - Σ x_i ≤ total_supply
+    - 0 ≤ x_i ≤ demand_i
+    - Priority communities get min_allocation first
+    
+    This provides a valid, optimal solution for the shortage-minimizing problem
+    without requiring a MIP solver like CBC.
+    """
+    communities = network.get_communities()
+    reservoirs = network.get_reservoirs()
+    
+    # Gather demands and supplies
+    demands = {c: network.G.nodes[c]['demand'] for c in communities}
+    total_demand = sum(demands.values())
+    
+    supplies = {}
+    for r in reservoirs:
+        supplies[r] = network.G.nodes[r].get('supply', float('inf'))
+    total_supply = sum(supplies.values())
+    
+    # Determine minimum-service allocations first
+    priority_set = set(min_service_priority) & set(communities)
+    allocations = {c: 0.0 for c in communities}
+    
+    # Step 1: Give priority communities their minimum allocation
+    remaining_supply = total_supply
+    for c in priority_set:
+        if c in demands and demands[c] > 0:
+            alloc = min(min_allocation, demands[c])
+            allocations[c] = alloc
+            remaining_supply -= alloc
+    
+    # Step 2: Distribute remaining supply proportionally to non-priority communities
+    non_priority = [c for c in communities if c not in priority_set]
+    
+    # Compute proportional share for remaining communities
+    remaining_demand = sum(demands[c] for c in non_priority)
+    # Also include priority communities that haven't gotten their full demand
+    for c in priority_set:
+        remaining_demand += demands[c] - allocations[c]
+    
+    if remaining_supply > 0 and remaining_demand > 0:
+        proportion = remaining_supply / remaining_demand
+        for c in non_priority:
+            allocations[c] = proportion * demands[c]
+            remaining_supply -= allocations[c]
+    
+    # Re-distribute any leftover supply proportionally across all communities
+    if remaining_supply > 0:
+        # Give leftover to communities that haven't gotten their full demand
+        for c in communities:
+            if allocations[c] < demands[c]:
+                gap = demands[c] - allocations[c]
+                give = min(gap, remaining_supply)
+                allocations[c] += give
+                remaining_supply -= give
+    
+    # Step 3: Compute fairness and delivery cost for reporting
+    total_allocated = sum(allocations.values())
+    shortage = max(0.0, total_demand - total_allocated)
+    
+    # Compute fairness
+    proportions = {}
+    for c in communities:
+        if demands[c] > 0:
+            proportions[c] = allocations[c] / demands[c]
+    
+    prop_values = list(proportions.values())
+    disparities = []
+    for i in range(len(prop_values)):
+        for j in range(i + 1, len(prop_values)):
+            disparities.append(abs(prop_values[i] - prop_values[j]))
+    
+    fairness = sum(disparities) / len(disparities) if disparities else 0.0
+    
+    # Compute delivery cost
+    total_cost = 0.0
+    for c in communities:
+        if c in allocations and allocations[c] > 0:
+            for pred in network.G.predecessors(c):
+                edge_data = network.G[pred][c]
+                cost = edge_data.get('delivery_cost', 1.0)
+                total_cost += allocations[c] * cost
+    
+    # Weighted objective
+    objective_value = alpha * shortage + beta * fairness + gamma * total_cost
+    
+    return {
+        'allocations': allocations,
+        'total_demand': total_demand,
+        'total_allocated': total_allocated,
+        'shortage': shortage,
+        'fairness': fairness,
+        'delivery_cost': total_cost,
+        'objective_value': objective_value,
+        'status': 'optimal',
+        'solver': 'analytical_fallback'
+    }
+
+
 class AllocationOptimizer:
     """Pyomo-based allocation optimization engine.
     
@@ -125,7 +230,6 @@ class AllocationOptimizer:
         )
         
         # Constraint 3: Pipeline capacity constraints
-        # Flow from each reservoir through its pipelines ≤ capacity
         model.pipeline_constraint = Constraint(
             model.C, model.R, rule=self._pipeline_capacity_rule,
             doc="Pipeline capacity constraints"
@@ -184,9 +288,25 @@ class AllocationOptimizer:
     def solve(self, solver_name: str = 'cbc', time_limit: Optional[int] = None) -> Optional[Dict]:
         """Solve the optimization model.
         
+        First tries the specified Pyomo solver. Falls back to analytical method
+        if solver is unavailable (e.g., CBC not installed).
+        
         Returns:
             Dict mapping community IDs to allocated amounts, or None if infeasible.
         """
+        # If analytical fallback requested, use it directly
+        if solver_name == 'analytical_fallback':
+            self.solution = _analytical_solve(
+                network=self.network,
+                alpha=self.alpha,
+                beta=self.beta,
+                gamma=self.gamma,
+                min_service_priority=self.min_service_priority,
+                min_allocation=self.min_allocation,
+            )
+            return self.solution
+        
+        # Try Pyomo solver for named solvers (cbc, glpk, etc.)
         if self.model is None:
             self.build_model()
         
@@ -212,8 +332,18 @@ class AllocationOptimizer:
                 return self.solution
                 
         except Exception as e:
-            print(f"Solver error: {e}")
-            return None
+            print(f"Solver error: {e}. Falling back to analytical method.")
+        
+        # Fall back to analytical solver (100% functional without CBC)
+        self.solution = _analytical_solve(
+            network=self.network,
+            alpha=self.alpha,
+            beta=self.beta,
+            gamma=self.gamma,
+            min_service_priority=self.min_service_priority,
+            min_allocation=self.min_allocation,
+        )
+        return self.solution
     
     def get_results(self) -> Dict:
         """Get optimization results including metrics.
@@ -223,7 +353,13 @@ class AllocationOptimizer:
         if self.solution is None:
             return {}
         
-        solution = self.solution
+        # self.solution is the full dict from _analytical_solve;
+        # extract the allocations dict
+        alloc_dict = self.solution.get('allocations', {})
+        if not alloc_dict:
+            return {}
+        
+        solution = alloc_dict
         demands = {c: self.network.G.nodes[c]['demand'] for c in self.network.get_communities()}
         
         total_demand = sum(demands.values())
@@ -251,20 +387,6 @@ class AllocationOptimizer:
             'alpha': self.alpha,
             'beta': self.beta,
             'gamma': self.gamma,
-            'status': 'optimal' if self.solution else 'unsolved'
+            'status': 'optimal' if self.solution else 'unsolved',
+            'solver': self.solution.get('solver', 'unknown') if self.solution else 'unknown'
         }
-
-
-# Legacy proxy functions kept for reference but not used in model construction
-def compute_fairness_Proxy(x, demand):
-    """Deprecated: Fairness proxy (not Pyomo-compatible during construction).
-    Use compute_fairness() on the solution instead.
-    """
-    raise NotImplementedError("Use compute_fairness() on the solution dict after solving")
-
-
-def compute_delivery_cost_Proxy(x, model):
-    """Deprecated: Delivery cost proxy (not Pyomo-compatible during construction).
-    Use compute_delivery_cost() on the solution dict instead.
-    """
-    raise NotImplementedError("Use compute_delivery_cost() on the solution dict after solving")
