@@ -6,6 +6,8 @@ from typing import Dict, List, Optional, Tuple
 import networkx as nx
 import numpy as np
 
+from aquaroute.models.water_network import WaterNetwork
+
 try:  # Pyomo is an optional hard dependency for the LP path.
     from pyomo.environ import (
         ConcreteModel,
@@ -23,8 +25,6 @@ try:  # Pyomo is an optional hard dependency for the LP path.
     PYOMO_AVAILABLE = True
 except Exception:  # pragma: no cover - exercised only when pyomo is absent
     PYOMO_AVAILABLE = False
-
-from aquaroute.models.water_network import WaterNetwork
 
 SOLVER_CANDIDATES: Tuple[str, ...] = ("appsi_highs", "highs", "cbc", "glpk")
 
@@ -47,6 +47,12 @@ def compute_fairness(allocations: Dict[int, float], demands: Dict[int, float]) -
     Zero means every community receives the same fraction of its demand; larger
     values indicate greater inequity. Demand normalisation makes communities with
     different needs comparable.
+
+    Returns
+    -------
+    float
+        Mean pairwise proportional disparity. 0.0 if fewer than 2 communities
+        with positive demand.
     """
     communities = [n for n in allocations if n in demands and demands[n] > 0]
     if len(communities) <= 1:
@@ -64,7 +70,20 @@ def compute_fairness(allocations: Dict[int, float], demands: Dict[int, float]) -
 
 
 def compute_shortage(allocations: Dict[int, float], demands: Dict[int, float]) -> float:
-    """Total unmet demand across communities."""
+    """Total unmet demand across communities.
+
+    Parameters
+    ----------
+    allocations : dict
+        Mapping of community ID -> allocated volume.
+    demands : dict
+        Mapping of community ID -> demand volume.
+
+    Returns
+    -------
+    float
+        Total unmet demand (= max(0, sum(demands) - sum(allocations))).
+    """
     total_demand = sum(demands.values())
     total_allocated = sum(allocations.values())
     return max(0.0, total_demand - total_allocated)
@@ -79,6 +98,22 @@ def compute_delivery_cost(allocations: Dict[int, float], network: WaterNetwork,
     allocations are known, the cheapest incoming pipeline is used as a
     lower-bound estimate.  This avoids the previous bug of counting the same
     delivered volume once per incoming pipe.
+
+    Parameters
+    ----------
+    allocations : dict
+        Mapping of community ID -> allocated volume.
+    network : WaterNetwork
+        The network instance, used to look up edge capacities and costs.
+    path_flows : dict, optional
+        Mapping of (u, v) edge -> flow volume. If provided, the exact routed
+        cost is computed; otherwise a lower-bound estimate using the cheapest
+        incoming edge cost per community is returned.
+
+    Returns
+    -------
+    float
+        Total delivery cost.
     """
     if path_flows is not None:
         return float(sum(flow * network.G[u][v].get("delivery_cost", 1.0)
@@ -109,6 +144,30 @@ def validate_solution(allocations: Dict[int, float], network: WaterNetwork,
     Checks source availability, individual demand limits, non-negativity,
     pipeline/network delivery capacity (via max-flow effective capacities) and
     the minimum-service guarantee.  Returns ``(is_valid, violations)``.
+
+    Parameters
+    ----------
+    allocations : dict
+        Mapping of community ID -> allocated volume.
+    network : WaterNetwork
+        The network instance.
+    demands : dict
+        Mapping of community ID -> demand volume.
+    total_supply : float
+        Total supply available from all reservoirs.
+    effective_caps : dict, optional
+        Per-community effective capacity (max deliverable volume). If ``None``,
+        computed via ``effective_capacities``.
+    min_service_priority : list, optional
+        Community IDs that must receive at least ``min_allocation``.
+    min_allocation : float, optional
+        Minimum allocation required for each priority community.
+
+    Returns
+    -------
+    tuple
+        ``(is_valid, violations)`` where ``is_valid`` is ``True`` if no hard
+        constraints are violated (``C5`` warnings are excluded).
     """
     violations: List[str] = []
     communities = network.get_communities()
@@ -160,6 +219,11 @@ def effective_capacities(network: WaterNetwork) -> Dict[int, float]:
 
     Uses a super-source joined to every reservoir (capacity = supply) so that
     transshipment through intermediate communities is accounted for.
+
+    Returns
+    -------
+    dict
+        Mapping of community ID -> maximum deliverable volume.
     """
     G = network.G
     reservoirs = network.get_reservoirs()
@@ -201,6 +265,11 @@ def max_total_deliverable(network: WaterNetwork) -> float:
     super-sink (communities capped at their demand).  Unlike summing
     per-community ``effective_capacities`` this respects shared pipelines, so it
     is the correct global budget for the analytical fallback.
+
+    Returns
+    -------
+    float
+        Maximum total volume that can be delivered simultaneously.
     """
     G = network.G
     communities = network.get_communities()
@@ -273,7 +342,13 @@ def _proportional_waterfill(demands: List[float], caps: List[float],
 
 
 def _equal_waterfill(limits: List[float], budget: float) -> List[float]:
-    """Distribute ``budget`` as evenly as possible subject to per-sink limits."""
+    """Distribute ``budget`` as evenly as possible subject to per-sink limits.
+
+    Returns the volume assigned to each sink.  ``limits`` are per-sink caps
+    (e.g. ``min(demand - alloc, cap - alloc)``) and ``budget`` is the total
+    volume to spread.  The algorithm guarantees that every sink receives at most
+    its limit and the total allocated equals ``budget`` (or as much as feasible).
+    """
     n = len(limits)
     alloc = [0.0] * n
     remaining = budget
@@ -290,6 +365,15 @@ def _equal_waterfill(limits: List[float], budget: float) -> List[float]:
             if alloc[i] >= limits[i] - 1e-9:
                 active.remove(i)
         if not progressed:
+            # No sink can take more; distribute residual proportionally
+            # to active sinks that still have room.
+            total_room = sum(max(limits[i] - alloc[i], 0.0) for i in active)
+            if total_room > 0:
+                for i in active:
+                    give = (remaining * (limits[i] - alloc[i]) / total_room)
+                    if give > 1e-9:
+                        alloc[i] += give
+                        remaining -= give
             break
     return alloc
 
@@ -302,6 +386,32 @@ def _analytical_solve(network: WaterNetwork, strategy: str = "weighted",
 
     Produces genuinely different allocations per strategy so that the
     comparative evaluation remains meaningful even without an LP solver.
+
+    Parameters
+    ----------
+    network : WaterNetwork
+        The water distribution network model.
+    strategy : str, optional
+        One of ``"shortage_min"``, ``"proportional"``, ``"maxmin"``,
+        ``"uniform"``, or ``"weighted"``.  Determines the secondary objective
+        after Stage 1 (minimise total shortage) has been resolved.
+    alpha, beta, gamma : float, optional
+        Weights for the combined objective ``alpha*shortage + beta*fairness +
+        gamma*cost``.  Only used when ``strategy`` is ``"weighted"``.
+    min_service_priority : list of int, optional
+        Community IDs that must receive at least ``min_allocation`` units.
+    min_allocation : float, optional
+        Minimum allocation for each priority community.  If the guarantee is
+        physically impossible the LP is infeasible and the analytical fallback
+        serves priority communities as far as supply allows, reporting a ``C5``
+        warning.
+
+    Returns
+    -------
+    dict
+        Solution dictionary with keys: ``allocations``, ``flows``,
+        ``total_demand``, ``total_allocated``, ``shortage``, ``fairness``,
+        ``delivery_cost``, ``objective_value``, ``status``, ``solver``.
     """
     min_service_priority = min_service_priority or []
     communities = network.get_communities()
@@ -337,14 +447,18 @@ def _analytical_solve(network: WaterNetwork, strategy: str = "weighted",
             alloc[c] += vol[i]
     elif strategy == "maxmin":
         # Egalitarian: repeatedly give to the sink with the smallest served fraction.
-        for _ in range(len(idx) * 100):
-            if remaining <= 1e-9:
+        for _ in range(max(len(idx) * 10, 200)):
+            if remaining <= 1e-12:
                 break
-            cand = [i for i in range(len(idx)) if room_after_min[i] > 1e-9]
+            cand = [i for i in range(len(idx)) if room_after_min[i] > 1e-12]
             if not cand:
                 break
             i = min(cand, key=lambda k: (alloc[idx[k]] / demands[idx[k]]) if demands[idx[k]] else 1.0)
-            step = min(room_after_min[i], remaining, max(remaining / max(1, len(cand)), 1e-6))
+            # Step size: ensure at least a minimum increment while respecting remaining room.
+            max_step = remaining / max(1, len(cand))
+            step = min(room_after_min[i], remaining, max(max_step, 1e-6))
+            if step <= 1e-12:
+                break
             alloc[idx[i]] += step
             room_after_min[i] -= step
             remaining -= step
