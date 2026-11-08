@@ -33,14 +33,13 @@ def _snapshot(network: WaterNetwork, scenario_type: str, failures: List,
     supply = {}
     for r in reservoirs:
         current = network.G.nodes[r].get("supply", float("inf"))
-        if finite_supply is not None:
-            # Cap total available supply at ``finite_supply`` distributed
-            # evenly across sources.  Used for supply-disruption scenarios
-            # where the modelled (infinite) reservoir head must be bounded.
-            per_source = finite_supply / max(1, len(reservoirs))
-            supply[r] = min(current, per_source) if np.isfinite(current) else per_source
-        elif np.isfinite(current):
+        if np.isfinite(current):
+            # Explicit finite supply (e.g. synthetic networks): scale directly.
             supply[r] = current * supply_scale
+        elif finite_supply is not None:
+            # Infinite (head-driven) source: bound total available supply.
+            per_source = finite_supply / max(1, len(reservoirs))
+            supply[r] = per_source
         else:
             supply[r] = current
     return {
@@ -70,7 +69,8 @@ class ScenarioGenerator:
         # genuine supply disruption we bound the total available supply at
         # ``reduction_factor`` of current demand.
         cap = reduction_factor * network.total_demand()
-        return _snapshot(network, "supply_reduction", [], finite_supply=cap)
+        return _snapshot(network, "supply_reduction", [],
+                         supply_scale=reduction_factor, finite_supply=cap)
 
     @staticmethod
     def pipeline_failure_scenario(network: WaterNetwork,

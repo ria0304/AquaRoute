@@ -844,15 +844,18 @@ class AllocationOptimizer:
         model.node_balance = Constraint(list(self.network.G.nodes()), rule=_balance)
 
         # Minimum-service is a hard guarantee: each priority community must
-        # receive at least ``min_allocation``.  If this is physically
-        # impossible the LP is infeasible and solve() falls back to the
-        # analytical solver, which prioritises minimum service as far as
-        # supply allows and reports a C5 warning.
-        self._prio = [c for c in self.min_service_priority if c in self._demands]
+        # receive at least ``min_allocation``.  Only communities with positive
+        # demand are eligible (a zero-demand node cannot receive service).
+        # If the guarantee is physically impossible the LP is infeasible and
+        # solve() falls back to the analytical solver, which prioritises
+        # minimum service as far as supply allows and reports a C5 warning.
+        self._prio = [c for c in self.min_service_priority
+                      if c in self._demands and self._demands[c] > 0]
         if self._prio and self.min_allocation > 0:
             model.MS = Set(initialize=self._prio)
             model.min_service = Constraint(
-                model.MS, rule=lambda m, c: m.x[c] >= self.min_allocation)
+                model.MS,
+                rule=lambda m, c: m.x[c] >= min(self.min_allocation, self._demands[c]))
 
         demand_pos = [c for c in self._demands if self._demands[c] > 0]
         self._pairs = list(itertools.combinations(demand_pos, 2))

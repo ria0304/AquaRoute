@@ -698,6 +698,51 @@ class EvaluationSuite:
         with open(filepath, "w") as fh:
             json.dump(export, fh, indent=2)
 
+    def hydraulic_validation_report(self, scenario_type: str = "supply_reduction") -> Dict[str, Dict]:
+        """Validate each approach's allocation on the *original* EPANET model.
+
+        Each approach is solved under the chosen disruption scenario (default
+        ``supply_reduction``, which yields partial-service allocations) and the
+        resulting allocation is fed back into the real network and simulated
+        with the EPANET engine.  The report captures pressure/velocity
+        feasibility and fidelity relative to the full-demand baseline.  Returns
+        an empty dict when the original network file is unavailable.
+        """
+        metadata = getattr(self.network, "metadata", None)
+        if not metadata or not metadata.get("source_path"):
+            return {}
+        try:
+            from aquaroute.algorithms.hydraulics import HydraulicValidator
+            from .uncertainty import apply_scenario
+            validator = HydraulicValidator(self.network, metadata)
+        except Exception:
+            return {}
+
+        scenario = next((s for s in self.scenarios
+                         if s.get("scenario_type") == scenario_type), None)
+
+        report: Dict[str, Dict] = {}
+        for approach_name, approach_kwargs in self.approaches:
+            net_copy = self._copy_network()
+            if scenario is not None:
+                apply_scenario(net_copy, scenario)
+            try:
+                solution = self._solve_with_optimizer(net_copy, dict(approach_kwargs))
+            except Exception as exc:  # pragma: no cover - defensive
+                report[approach_name] = {"error": str(exc)}
+                continue
+            if not solution or not solution.get("allocations"):
+                report[approach_name] = {"error": "no allocation"}
+                continue
+            allocs = {int(k): float(v) for k, v in solution["allocations"].items()}
+            try:
+                rep = validator.validate(allocs)
+                rep["scenario_type"] = scenario_type
+                report[approach_name] = rep
+            except Exception as exc:  # pragma: no cover - defensive
+                report[approach_name] = {"error": str(exc)}
+        return report
+
     def compute_summary_metrics(self) -> Dict:
         """Compute summary statistics across all approaches and scenarios.
 
@@ -714,13 +759,25 @@ class EvaluationSuite:
             def col(key):
                 return [row[key] for row in rows if isinstance(row.get(key), (int, float))]
 
+            # Prefer raw per-repeat observations for statistics when present.
+            def raw_col(key):
+                vals = []
+                for row in rows:
+                    raw = row.get("repeats_raw")
+                    if raw:
+                        vals.extend(rr[key] for rr in raw
+                                    if isinstance(rr.get(key), (int, float)))
+                return vals
+
             # Basic metrics
-            shortages = col("shortage")
-            fairness_vals = col("fairness")
-            jains_vals = col("jains_fairness")
-            costs = col("delivery_cost")
-            cvar_vals = col("cvar")
-            runtimes = col("runtime")
+            shortages = raw_col("shortage") or col("shortage")
+            fairness_vals = raw_col("fairness") or col("fairness")
+            jains_vals = raw_col("jains_fairness") or col("jains_fairness")
+            jains_vol_vals = (raw_col("jains_fairness_volume")
+                              or col("jains_fairness_volume"))
+            costs = raw_col("delivery_cost") or col("delivery_cost")
+            cvar_vals = raw_col("cvar") or col("cvar")
+            runtimes = raw_col("runtime") or col("runtime")
 
             # Compute statistics
             n = len(rows)
@@ -737,9 +794,17 @@ class EvaluationSuite:
                 "worst_fairness": float(max(fairness_vals)) if fairness_vals else 0.0,
                 "std_fairness": float(np.std(fairness_vals, ddof=1)) if len(fairness_vals) > 1 else 0.0,
 
-                # Jain's fairness index
+                # Jain's fairness index (service-normalised)
                 "avg_jains_fairness": float(np.mean(jains_vals)) if jains_vals else 1.0,
                 "worst_jains_fairness": float(max(jains_vals)) if jains_vals else 1.0,
+                "std_jains_fairness": (float(np.std(jains_vals, ddof=1))
+                                       if len(jains_vals) > 1 else 0.0),
+
+                # Jain's fairness index (raw volume)
+                "avg_jains_fairness_volume": (float(np.mean(jains_vol_vals))
+                                              if jains_vol_vals else 1.0),
+                "std_jains_fairness_volume": (float(np.std(jains_vol_vals, ddof=1))
+                                              if len(jains_vol_vals) > 1 else 0.0),
 
                 # Cost statistics
                 "avg_cost": float(np.mean(costs)) if costs else 0.0,
@@ -755,7 +820,8 @@ class EvaluationSuite:
                 "std_runtime": float(np.std(runtimes, ddof=1)) if len(runtimes) > 1 else 0.0,
 
                 # Feasibility rate
-                "feasibility_rate": (sum(1 for s in shortages if s == 0) / n) if n > 0 else 0.0,
+                "feasibility_rate": (sum(1 for s in shortages if s == 0)
+                                     / len(shortages)) if shortages else 0.0,
 
                 # Scenario count
                 "scenario_count": n,
@@ -796,9 +862,21 @@ class EvaluationSuite:
         if not a or not b:
             return None
 
+        def _samples(rows):
+            """Flatten per-repeat observations when available, else scenario means."""
+            vals = []
+            for r in rows:
+                raw = r.get("repeats_raw")
+                if raw:
+                    vals.extend(rr[metric] for rr in raw
+                                if isinstance(rr.get(metric), (int, float)))
+                elif isinstance(r.get(metric), (int, float)):
+                    vals.append(r[metric])
+            return [v for v in vals if not np.isnan(v)]
+
         # Extract the metric values for each repeat-scenario combination
-        sample_a = [r.get(metric, float("nan")) for r in a if r.get(metric) is not None and not np.isnan(r.get(metric, float("nan")))]
-        sample_b = [r.get(metric, float("nan")) for r in b if r.get(metric) is not None and not np.isnan(r.get(metric, float("nan")))]
+        sample_a = _samples(a)
+        sample_b = _samples(b)
 
         if len(sample_a) < 2 or len(sample_b) < 2:
             return None
