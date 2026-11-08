@@ -73,15 +73,27 @@ def main(argv=None) -> int:
     if aqua in self_approach_names(results):
         for metric in ("shortage", "fairness", "jains_fairness",
                        "priority_service", "delivery_cost"):
-            significance[metric] = {}
+            raw = {}
             for other in results:
                 if other == aqua:
                     continue
                 try:
-                    significance[metric][other] = suite.statistical_significance(
-                        metric, aqua, other)
+                    res = suite.statistical_significance(metric, aqua, other)
                 except Exception as exc:  # pragma: no cover - defensive
-                    significance[metric][other] = {"error": str(exc)}
+                    res = {"error": str(exc)}
+                raw[other] = res
+            # Holm-Bonferroni correction across the baseline comparisons.
+            pvals = [r.get("wilcoxon_p_value") for r in raw.values()
+                     if isinstance(r, dict) and "error" not in r]
+            holm = suite.holm_correction(pvals) if pvals else []
+            holm_idx = 0
+            for other, res in raw.items():
+                if isinstance(res, dict) and "error" not in res:
+                    if holm_idx < len(holm):
+                        res["holm_adjusted_p_value"] = holm[holm_idx]["holm_adjusted_p_value"]
+                        res["holm_significant"] = holm[holm_idx]["significant"]
+                    holm_idx += 1
+            significance[metric] = raw
 
     hydraulic = {}
     if args.hydraulic:
