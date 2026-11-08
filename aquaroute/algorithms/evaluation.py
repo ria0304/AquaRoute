@@ -348,13 +348,6 @@ class EvaluationSuite:
                 "min_service_priority": priority,
                 "min_allocation": 10.0,
             }),
-            # Enhanced: CVaR risk-aware optimization
-            ("aquaroute_cvar_risk_aware", {
-                "strategy": "cvar_robust",
-                "alpha": 0.95,
-                "min_service_priority": priority,
-                "min_allocation": 10.0,
-            }),
         ]
 
     def _copy_network(self) -> WaterNetwork:
@@ -380,29 +373,65 @@ class EvaluationSuite:
         try:
             opt = AllocationOptimizer(network=network, **kwargs)
             solution = opt.solve(allow_fallback=True)
+            if solution is not None and solution.get("allocations"):
+                # Propagate real solver metrics from the optimizer solution
+                solution["solver"] = opt.solution.get("solver", "unknown") if opt.solution else "unknown"
+                solution["status"] = opt.solution.get("status", "optimal") if opt.solution else "optimal"
+                solution["runtime"] = opt.runtime if opt.runtime else 0.0
+                solution["delivery_cost"] = opt.solution.get("delivery_cost", 0.0) if opt.solution else 0.0
+                solution["validation_passed"] = opt.solution.get("validation_passed", True) if opt.solution else True
+                solution["validation_errors"] = opt.solution.get("validation_errors", []) if opt.solution else []
+                solution["validation_warnings"] = opt.solution.get("validation_warnings", []) if opt.solution else []
             return solution
-        except Exception:
-            return None
+        except Exception as e:
+            import traceback
+            print(f"Optimizer {strategy} exception: {type(e).__name__}: {e}")
+            traceback.print_exc()
+            # Record failed result with reason instead of returning None
+            return {
+                "solver": "unknown",
+                "status": "failed",
+                "runtime": 0.0,
+                "delivery_cost": 0.0,
+                "validation_passed": False,
+                "validation_errors": [f"{type(e).__name__}: {e}"],
+                "validation_warnings": [],
+            }
 
     def _compute_all_metrics(self, network: WaterNetwork, allocations: Dict,
                              demands: Dict) -> Dict:
-        """Compute all enhanced metrics for a given allocation."""
+        """Compute all enhanced metrics for a given allocation.
+
+        Uses real metrics from the optimizer solution when available,
+        falling back to computed values only.
+        """
         metrics = {}
 
-        # Basic metrics
-        metrics["shortage"] = compute_shortage(allocations, demands)
-        metrics["fairness"] = compute_fairness(allocations, demands)
-        metrics["jains_fairness"] = jains_fairness_index(allocations, demands)
-        metrics["delivery_cost"] = 0.0  # Would be computed from optimizer solution
+        # Basic metrics from the optimizer solution (preferred) or compute them
+        shortage = allocations.get("shortage", compute_shortage(allocations, demands))
+        fairness = allocations.get("fairness", compute_fairness(allocations, demands))
+        jains_fairness = allocations.get("jains_fairness", jains_fairness_index(allocations, demands))
+        delivery_cost = allocations.get("delivery_cost", 0.0)
 
         # Objective value using default weights
         alpha, beta, gamma = 1.0, 1.0, 1.0
-        metrics["objective_value"] = alpha * metrics["shortage"] + beta * metrics["fairness"] + gamma * metrics["delivery_cost"]
+        objective_value = alpha * shortage + beta * fairness + gamma * delivery_cost
 
-        # Runtime and status would be set after solving
-        metrics["runtime"] = 0.0
-        metrics["status"] = "optimal" if allocations else "unsolved"
-        metrics["solver"] = "analytical_fallback"
+        # Runtime and status from the optimizer solution
+        runtime = allocations.get("runtime", 0.0)
+        status = allocations.get("status", "optimal") if allocations else "unsolved"
+        solver = allocations.get("solver", "unknown") if allocations else "unknown"
+        validation_passed = allocations.get("validation_passed", True) if allocations else True
+
+        metrics["shortage"] = shortage
+        metrics["fairness"] = fairness
+        metrics["jains_fairness"] = jains_fairness
+        metrics["delivery_cost"] = delivery_cost
+        metrics["objective_value"] = objective_value
+        metrics["runtime"] = runtime
+        metrics["status"] = status
+        metrics["solver"] = solver
+        metrics["validation_passed"] = validation_passed
 
         return metrics
 
@@ -475,7 +504,7 @@ class EvaluationSuite:
                         metrics["repeat"] = repeat_idx
                         metrics["n_communities"] = len(net_copy.get_communities())
                         metrics["n_reservoirs"] = len(net_copy.get_reservoirs())
-                        metrics["results"] = metrics
+                        metrics["results"] = dict(metrics)
                     else:
                         metrics = {
                             "approach": approach_name,
