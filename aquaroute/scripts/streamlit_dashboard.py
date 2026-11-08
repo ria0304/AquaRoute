@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 
+import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
@@ -165,19 +166,17 @@ def main():
     failed_edges = []
     if params['scenario_type'] == "Pipeline Failure":
         edges = list(network.G.edges())
-        np_random = __import__('numpy').random
-        np_random.seed(42)
+        np.random.seed(42)
         n_to_fail = min(params['n_failed_pipelines'], len(edges))
-        failed_indices = np_random.choice(len(edges), size=n_to_fail, replace=False)
+        failed_indices = np.random.choice(len(edges), size=n_to_fail, replace=False)
         failed_edges = [edges[i] for i in failed_indices]
         for u, v in failed_edges:
             network.G.remove_edge(u, v)
     elif params['scenario_type'] == "Multiple Disruptions":
         edges = list(network.G.edges())
-        np_random = __import__('numpy').random
-        np_random.seed(42)
+        np.random.seed(42)
         n_to_fail = min(params['n_failed_pipelines'], len(edges))
-        failed_indices = np_random.choice(len(edges), size=n_to_fail, replace=False)
+        failed_indices = np.random.choice(len(edges), size=n_to_fail, replace=False)
         failed_edges = [edges[i] for i in failed_indices]
         for u, v in failed_edges:
             network.G.remove_edge(u, v)

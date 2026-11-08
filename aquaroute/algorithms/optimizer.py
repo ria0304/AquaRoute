@@ -232,12 +232,17 @@ def effective_capacities(network: WaterNetwork) -> Dict[int, float]:
         return {}
 
     total_demand = network.total_demand()
+    # Use a large capacity value; finite capacities are scaled relative to total demand.
     big = max(total_demand, 1.0) * 10 + 1.0
 
     H = nx.DiGraph()
     for u, v, data in G.edges(data=True):
         cap = data.get("capacity", float("inf"))
         H.add_edge(u, v, capacity=big if not np.isfinite(cap) else float(cap))
+
+    if not reservoirs:
+        # No supply sources; communities are unreachable.
+        return {c: 0.0 for c in communities}
 
     super_source = "__aquaroute_source__"
     for r in reservoirs:
@@ -315,6 +320,10 @@ def _proportional_waterfill(demands: List[float], caps: List[float],
 
     Returns the volume assigned to each sink.  ``demands``/``caps`` are parallel
     lists; ``budget`` is the total volume available.
+
+    Allocation respects both demand limits and cap limits.  The residual budget
+    after all sinks have hit their limits is distributed proportionally to active
+    sinks that still have room.
     """
     n = len(demands)
     alloc = [0.0] * n
@@ -324,7 +333,17 @@ def _proportional_waterfill(demands: List[float], caps: List[float],
     while remaining > 1e-9 and active:
         total_weight = sum(demands[i] for i in active)
         if total_weight <= 0:
+            # No community can receive more; distribute remaining proportionally
+            # to sinks with remaining room.
+            total_room = sum(max(caps[i] - alloc[i], 0.0) for i in active)
+            if total_room > 0:
+                for i in active:
+                    give = (remaining * (caps[i] - alloc[i]) / total_room)
+                    if give > 1e-9:
+                        alloc[i] += give
+                        remaining -= give
             break
+
         progressed = False
         for i in list(active):
             share = remaining * (demands[i] / total_weight)
@@ -336,7 +355,16 @@ def _proportional_waterfill(demands: List[float], caps: List[float],
                 progressed = True
             if alloc[i] >= min(demands[i], caps[i]) - 1e-9:
                 active.remove(i)
-        if not progressed:
+        if not progressed and remaining > 1e-9:
+            # All active sinks are at their limits but budget remains;
+            # distribute residual proportionally to room available.
+            total_room = sum(max(caps[i] - alloc[i], 0.0) for i in active)
+            if total_room > 0:
+                for i in list(active):
+                    give = (remaining * (caps[i] - alloc[i]) / total_room)
+                    if give > 1e-9:
+                        alloc[i] += give
+                        remaining -= give
             break
     return alloc
 
@@ -364,9 +392,9 @@ def _equal_waterfill(limits: List[float], budget: float) -> List[float]:
                 progressed = True
             if alloc[i] >= limits[i] - 1e-9:
                 active.remove(i)
-        if not progressed:
-            # No sink can take more; distribute residual proportionally
-            # to active sinks that still have room.
+        if not progressed and remaining > 1e-9:
+            # No sink can take the equal share; distribute residual
+            # proportionally to remaining room.
             total_room = sum(max(limits[i] - alloc[i], 0.0) for i in active)
             if total_room > 0:
                 for i in active:
@@ -453,11 +481,13 @@ def _analytical_solve(network: WaterNetwork, strategy: str = "weighted",
             cand = [i for i in range(len(idx)) if room_after_min[i] > 1e-12]
             if not cand:
                 break
-            i = min(cand, key=lambda k: (alloc[idx[k]] / demands[idx[k]]) if demands[idx[k]] else 1.0)
-            # Step size: ensure at least a minimum increment while respecting remaining room.
+            # Find sink with smallest proportional service ratio.
+            i = min(cand, key=lambda k: alloc[idx[k]] / demands[idx[k]] if demands[idx[k]] > 0 else 1.0)
+            # Step size: give each candidate an equal share of remaining budget,
+            # capped by that sink's remaining room.
             max_step = remaining / max(1, len(cand))
-            step = min(room_after_min[i], remaining, max(max_step, 1e-6))
-            if step <= 1e-12:
+            step = min(room_after_min[i], remaining, max(max_step, 1e-12))
+            if step <= 1e-15:
                 break
             alloc[idx[i]] += step
             room_after_min[i] -= step

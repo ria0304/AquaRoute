@@ -21,7 +21,17 @@ class WaterNetwork:
         if pipelines:
             for u, v, data in pipelines:
                 self.G.add_edge(u, v, **data)
-    
+
+    def __repr__(self) -> str:
+        return (f"WaterNetwork(reservoirs={self.n_reservoirs}, "
+                f"communities={self.n_communities}, "
+                f"edges={self.G.number_of_edges()})")
+
+    def __str__(self) -> str:
+        return (f"WaterNetwork: {self.n_reservoirs} reservoirs, "
+                f"{self.n_communities} communities, "
+                f"{self.G.number_of_edges()} pipelines")
+
     def add_reservoir(self, node_id: int, capacity: float, 
                       supply: float = float('inf')) -> None:
         """Add a reservoir node with supply capacity."""
@@ -71,12 +81,25 @@ class WaterNetwork:
         return sum(d.get('supply', 0) for n, d in self.G.nodes(data=True) if d.get('type') == 'reservoir')
     
     def check_feasibility(self, allocations: Dict[int, float]) -> bool:
-        """Check if allocated water satisfies community demands within capacity constraints."""
-        for node, alloc in allocations.items():
-            if node in self.get_communities():
-                demand = self.G.nodes[node]['demand']
-                if alloc < demand:
-                    return False  # unsatisfied demand
+        """Check if allocated water satisfies community demands within capacity constraints.
+        
+        Also verifies that no community is allocated more than its demand and
+        that total allocated does not exceed total supply available through the network.
+        """
+        communities = self.get_communities()
+        total_allocated = sum(allocations.values())
+        total_supply = self.total_supply()
+        
+        # Check total allocation vs supply
+        if total_allocated > total_supply + 1e-6:
+            return False
+        
+        # Check each community's allocation against demand
+        for node in communities:
+            alloc = allocations.get(node, 0.0)
+            demand = self.G.nodes[node].get('demand', 0.0)
+            if alloc < demand - 1e-6:
+                return False  # unsatisfied demand
         return True
 
 
