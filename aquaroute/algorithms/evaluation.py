@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import math
-import zlib
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -12,6 +12,18 @@ from aquaroute.algorithms.optimizer import AllocationOptimizer, compute_fairness
 from aquaroute.models.water_network import WaterNetwork
 
 from .uncertainty import ScenarioGenerator
+
+
+def _derive_seed(*parts) -> int:
+    """Deterministic, process-independent seed derived from stable inputs.
+
+    Uses SHA-256 over the stringified parts (Python's built-in ``hash`` is
+    salted per process and must never be used for experiment seeds).  Returns
+    a non-negative 31-bit integer suitable for ``numpy.random.RandomState``.
+    """
+    payload = "|".join(str(p) for p in parts).encode("utf-8")
+    digest = hashlib.sha256(payload).digest()
+    return int.from_bytes(digest[:4], "big") % (2**31)
 
 
 def _priority_communities(network: WaterNetwork) -> List[int]:
@@ -519,16 +531,19 @@ class EvaluationSuite:
 
         all_results: Dict[str, List[Dict]] = {}
 
+        # Common random numbers: the stochastic demand realization for a given
+        # (scenario, repeat) MUST be identical across strategies so that
+        # baseline comparisons are properly paired.  The seed therefore depends
+        # only on the base seed, the scenario identity and the repeat index --
+        # never on the strategy name.
         for approach_name, approach_kwargs in self.approaches:
             approach_results = []
-            for scenario in self.scenarios:
+            for scenario_idx, scenario in enumerate(self.scenarios):
                 repeats = []
                 for repeat_idx in range(n_repeats):
-                    # Deterministic per-approach seed.  Python's built-in
-                    # ``hash`` is salted per process (PYTHONHASHSEED) and would
-                    # make results irreproducible across runs; CRC32 is stable.
-                    approach_offset = zlib.crc32(approach_name.encode("utf-8")) % 100000
-                    repeat_seed = base_seed + repeat_idx * 1009 + approach_offset
+                    repeat_seed = _derive_seed(
+                        base_seed, scenario_idx,
+                        scenario.get("scenario_type", "unknown"), repeat_idx)
                     random_state = np.random.RandomState(repeat_seed)
 
                     net_copy = self._copy_network()
@@ -566,6 +581,7 @@ class EvaluationSuite:
                         metrics["approach"] = approach_name
                         metrics["scenario_type"] = scenario.get("scenario_type", "unknown")
                         metrics["repeat"] = repeat_idx
+                        metrics["seed"] = int(repeat_seed)
                         metrics["n_communities"] = len(net_copy.get_communities())
                         metrics["n_reservoirs"] = len(net_copy.get_reservoirs())
                         metrics["results"] = dict(metrics)
@@ -574,6 +590,7 @@ class EvaluationSuite:
                             "approach": approach_name,
                             "scenario_type": scenario.get("scenario_type", "unknown"),
                             "repeat": repeat_idx,
+                            "seed": int(repeat_seed),
                             "n_communities": len(net_copy.get_communities()),
                             "n_reservoirs": len(net_copy.get_reservoirs()),
                             "allocations": {},
@@ -714,12 +731,14 @@ class EvaluationSuite:
                     "n_communities": r.get("n_communities", 0),
                     "n_reservoirs": r.get("n_reservoirs", 0),
                     "n_repeats": r.get("n_repeats", 1),
+                    "seed": r.get("seed"),
                     "allocations": r.get("allocations", {}),
                 }
                 for k in ("shortage", "fairness", "jains_fairness",
                           "jains_fairness_volume", "priority_service",
                           "delivery_cost", "cvar",
-                          "objective_value", "runtime", "status", "solver"):
+                          "objective_value", "runtime", "status", "solver",
+                          "seed"):
                     entry[k] = r.get(k)
                 for k in ("shortage", "fairness", "jains_fairness",
                           "jains_fairness_volume", "priority_service",
@@ -733,6 +752,7 @@ class EvaluationSuite:
                     entry["repeats"] = [
                         {
                             "repeat": rr.get("repeat", i),
+                            "seed": rr.get("seed"),
                             **{k: rr.get(k) for k in
                                ("shortage", "fairness", "jains_fairness",
                                 "jains_fairness_volume", "priority_service",
@@ -746,50 +766,47 @@ class EvaluationSuite:
         with open(filepath, "w") as fh:
             json.dump(export, fh, indent=2)
 
-    def hydraulic_validation_report(self, scenario_type: str = "supply_reduction") -> Dict[str, Dict]:
-        """Validate each approach's allocation on the *original* EPANET model.
+    def hydraulic_validation_report(self) -> Dict[str, Dict]:
+        """Validate each approach under every scenario on the *original* EPANET model.
 
-        Each approach is solved under the chosen disruption scenario (default
-        ``supply_reduction``, which yields partial-service allocations) and the
-        resulting allocation is fed back into the real network and simulated
-        with the EPANET engine.  The report captures pressure/velocity
-        feasibility and fidelity relative to the full-demand baseline.  Returns
-        an empty dict when the original network file is unavailable.
+        Each approach is solved under each scenario and the resulting allocation
+        is fed back into the real network and simulated with the EPANET engine.
+        Disruptions are represented physically (demand spikes scale junction
+        demands, pipe failures close pipes, supply reduction caps source
+        outflow).  Returns a nested dict ``{approach: {scenario_type: report}}``.
+        Returns an empty dict when the original network file is unavailable.
         """
         metadata = getattr(self.network, "metadata", None)
         if not metadata or not metadata.get("source_path"):
             return {}
         try:
             from aquaroute.algorithms.hydraulics import HydraulicValidator
-
             from .uncertainty import apply_scenario
             validator = HydraulicValidator(self.network, metadata)
         except Exception:
             return {}
 
-        scenario = next((s for s in self.scenarios
-                         if s.get("scenario_type") == scenario_type), None)
-
         report: Dict[str, Dict] = {}
         for approach_name, approach_kwargs in self.approaches:
-            net_copy = self._copy_network()
-            if scenario is not None:
+            approach_report: Dict[str, dict] = {}
+            for scenario in self.scenarios:
+                scenario_type = scenario.get("scenario_type", "unknown")
+                net_copy = self._copy_network()
                 apply_scenario(net_copy, scenario)
-            try:
-                solution = self._solve_with_optimizer(net_copy, dict(approach_kwargs))
-            except Exception as exc:  # pragma: no cover - defensive
-                report[approach_name] = {"error": str(exc)}
-                continue
-            if not solution or not solution.get("allocations"):
-                report[approach_name] = {"error": "no allocation"}
-                continue
-            allocs = {int(k): float(v) for k, v in solution["allocations"].items()}
-            try:
-                rep = validator.validate(allocs)
-                rep["scenario_type"] = scenario_type
-                report[approach_name] = rep
-            except Exception as exc:  # pragma: no cover - defensive
-                report[approach_name] = {"error": str(exc)}
+                try:
+                    solution = self._solve_with_optimizer(net_copy, dict(approach_kwargs))
+                except Exception as exc:  # pragma: no cover - defensive
+                    approach_report[scenario_type] = {"error": str(exc)}
+                    continue
+                if not solution or not solution.get("allocations"):
+                    approach_report[scenario_type] = {"error": "no allocation"}
+                    continue
+                allocs = {int(k): float(v) for k, v in solution["allocations"].items()}
+                try:
+                    approach_report[scenario_type] = validator.validate(allocs, scenario)
+                except Exception as exc:  # pragma: no cover - defensive
+                    approach_report[scenario_type] = {"error": str(exc)}
+            report[approach_name] = approach_report
         return report
 
     def compute_summary_metrics(self) -> Dict:
@@ -980,34 +997,178 @@ class EvaluationSuite:
             ci_lower = None
             ci_upper = None
 
-        # Effect size interpretation
-        if abs(cohens_d) < 0.2:
-            effect_interpretation = "negligible"
-        elif abs(cohens_d) < 0.5:
-            effect_interpretation = "small"
-        elif abs(cohens_d) < 0.8:
-            effect_interpretation = "medium"
-        else:
-            effect_interpretation = "large"
+    def statistical_significance(self, metric: str = "shortage",
+                                  approach_a: Optional[str] = None,
+                                  approach_b: Optional[str] = None) -> Optional[Dict]:
+        """Perform a *paired* statistical comparison between two approaches.
 
+        Because scenarios are generated with common random numbers (the derived
+        seed depends only on the scenario and repeat index, never on the
+        strategy), the same stochastic realisation is seen by every approach
+        for a given ``(scenario, repeat)``.  Observations are therefore paired
+        by seed and tested with paired methods: a paired t-test and the
+        Wilcoxon signed-rank test, plus paired effect sizes.
+
+        Parameters
+        ----------
+        metric : str, optional
+            Metric to test. Default "shortage".
+        approach_a : str, optional
+            First approach name.
+        approach_b : str, optional
+            Second approach name.
+
+        Returns
+        -------
+        dict or None
+            Test results including paired t-statistic, Wilcoxon statistic,
+            p-values, effect sizes, confidence interval, and interpretation.
+        """
+        if approach_a not in self.results or approach_b not in self.results:
+            return None
+        a = self.results[approach_a]
+        b = self.results[approach_b]
+        if not a or not b:
+            return None
+
+        def _seed_samples(rows):
+            out: Dict[int, float] = {}
+            for r in rows:
+                raw = r.get("repeats_raw") if isinstance(r, dict) else None
+                if not raw:
+                    continue
+                for rr in raw:
+                    s = rr.get("seed")
+                    v = rr.get(metric)
+                    if s is None:
+                        continue
+                    if isinstance(v, (int, float)) and not np.isnan(v):
+                        out[int(s)] = float(v)
+            return out
+
+        sa = _seed_samples(a)
+        sb = _seed_samples(b)
+        common = sorted(set(sa) & set(sb))
+        if len(common) < 3:
+            return None
+
+        va = np.array([sa[s] for s in common], dtype=float)
+        vb = np.array([sb[s] for s in common], dtype=float)
+        diffs = va - vb
+        n = len(common)
+        mean_diff = float(np.mean(diffs))
+        std_diff = float(np.std(diffs, ddof=1)) if n > 1 else 0.0
+
+        import scipy.stats as stats
+
+        # Paired t-test on the differences.
+        t_stat = 0.0; p_t = 1.0; ci_lower = None; ci_upper = None; df = n - 1
+        try:
+            t_stat, p_t = stats.ttest_rel(va, vb)
+        except Exception:
+            t_stat = 0.0; p_t = 1.0
+        try:
+            if std_diff > 0 and n > 1:
+                h = stats.t.ppf(1 - 0.05 / 2, df)
+                se = std_diff / math.sqrt(n)
+                ci_lower = mean_diff - h * se
+                ci_upper = mean_diff + h * se
+        except Exception:
+            ci_lower = None; ci_upper = None
+
+        # Paired Cohen's d (difference SD).
+        cohens_d = mean_diff / std_diff if std_diff > 0 else 0.0
+        if abs(cohens_d) < 0.2:
+            d_interpretation = "negligible"
+        elif abs(cohens_d) < 0.5:
+            d_interpretation = "small"
+        elif abs(cohens_d) < 0.8:
+            d_interpretation = "medium"
+        else:
+            d_interpretation = "large"
+
+        # Wilcoxon signed-rank test (paired, non-parametric).
+        wilcoxon = self.wilcoxon_paired_test(va.tolist(), vb.tolist())
+
+        # Rank-biserial correlation from Wilcoxon (paired effect size).
+        w_stat = float(wilcoxon.get("statistic", 0.0))
+        n_pos = sum(1 for d in diffs if d > 0)
+        n_neg = sum(1 for d in diffs if d < 0)
+        rank_biserial = (n_pos - n_neg) / n if n > 0 else 0.0
+        if abs(rank_biserial) < 0.1:
+            rb_interpretation = "negligible"
+        elif abs(rank_biserial) < 0.3:
+            rb_interpretation = "small"
+        elif abs(rank_biserial) < 0.5:
+            rb_interpretation = "medium"
+        else:
+            rb_interpretation = "large"
+
+        # Use the Wilcoxon p-value as the primary (distribution-free) result.
+        p_value = float(wilcoxon.get("p_value", 1.0))
         significant = p_value < 0.05
+        better = mean_a < mean_b  # lower is better for most cost/shortage metrics
 
         return {
-            "t_statistic": float(t_stat),
-            "p_value": float(p_value),
-            "mean_difference": float(mean_a - mean_b),
+            "metric": metric,
+            "approach_a": approach_a,
+            "approach_b": approach_b,
+            "paired_t_statistic": float(t_stat),
+            "paired_t_p_value": float(p_t),
+            "wilcoxon_statistic": w_stat,
+            "wilcoxon_p_value": p_value,
+            "mean_difference": mean_diff,
             "confidence_interval_lower": float(ci_lower) if ci_lower is not None else None,
             "confidence_interval_upper": float(ci_upper) if ci_upper is not None else None,
-            "cohens_d": float(cohens_d),
-            "effect_interpretation": effect_interpretation,
-            "sample_size_a": len(sample_a),
-            "sample_size_b": len(sample_b),
-            "significant": significant,
+            "cohens_d_paired": float(cohens_d),
+            "cohens_d_interpretation": d_interpretation,
+            "rank_biserial": float(rank_biserial),
+            "rank_biserial_interpretation": rb_interpretation,
+            "sample_size_pairs": n,
+            "significant": bool(significant),
             "interpretation": (
-                f"{'better' if mean_a < mean_b else 'worse'} with {effect_interpretation} effect"
-                if significant else "No significant difference"
+                f"{'better' if better else 'worse'} ({d_interpretation} effect, "
+                f"{'significant' if significant else 'not significant'}, p={p_value:.3g})"
+                if significant else f"No significant difference (p={p_value:.3g})"
             ),
         }
+
+    def holm_correction(self, p_values: List[float], alpha: float = 0.05) -> List[Dict]:
+        """Step-down Holm-Bonferroni correction for multiple comparisons.
+
+        Parameters
+        ----------
+        p_values : list of float
+            Raw p-values (one per comparison).
+        alpha : float, optional
+            Family-wise error rate. Default 0.05.
+
+        Returns
+        -------
+        list of dict
+            One entry per input p-value (same order) with the Holm-adjusted
+            p-value and a ``significant`` flag.
+        """
+        import scipy.stats as stats
+        p_arr = np.array([float(p) if p is not None and not np.isnan(p) else 1.0
+                          for p in p_values], dtype=float)
+        m = len(p_arr)
+        order = np.argsort(p_arr)
+        adjusted = np.empty(m, dtype=float)
+        for rank, idx in enumerate(order, start=1):
+            adjusted[idx] = min(1.0, (m - rank + 1) * p_arr[idx])
+        # Enforce monotonicity (adjusted p-values non-decreasing with rank).
+        for rank in range(2, m + 1):
+            i = order[rank - 1]; j = order[rank - 2]
+            adjusted[i] = max(adjusted[i], adjusted[j])
+        return [
+            {
+                "raw_p_value": float(p_arr[i]),
+                "holm_adjusted_p_value": float(adjusted[i]),
+                "significant": bool(adjusted[i] < alpha),
+            }
+            for i in range(m)
+        ]
 
     def power_analysis(self, metric: str = "shortage",
                        effect_size: str = "medium",

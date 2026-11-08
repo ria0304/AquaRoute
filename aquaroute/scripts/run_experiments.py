@@ -85,18 +85,19 @@ def main(argv=None) -> int:
 
     hydraulic = {}
     if args.hydraulic:
-        print("\nRunning EPANET hydraulic validation...")
+        print("\nRunning EPANET hydraulic validation (all scenarios)...")
         hydraulic = suite.hydraulic_validation_report()
-        for name, rep in hydraulic.items():
-            if "error" in rep:
-                print(f"  {name:<34} error: {rep['error']}")
-            else:
-                print(f"  {name:<34} feasible={rep['feasible']} "
-                      f"abs={rep.get('absolute_feasible')} "
-                      f"min_p={rep['hydraulics']['min_pressure']:.2f}m "
-                      f"max_v={rep['hydraulics']['max_velocity']:.2f}m/s "
-                      f"new_p_viol={len(rep.get('new_pressure_violations', []))} "
-                      f"dP={rep['fidelity']['mean_abs_pressure_delta_m']:.2f}m")
+        for name, arep in hydraulic.items():
+            for stype, rep in arep.items():
+                if "error" in rep:
+                    print(f"  {name:<34} {stype:<18} error: {rep['error']}")
+                else:
+                    print(f"  {name:<34} {stype:<18} feasible={rep['feasible']} "
+                          f"abs={rep.get('absolute_feasible')} "
+                          f"min_p={rep['hydraulics']['min_pressure']:.2f}m "
+                          f"max_v={rep['hydraulics']['max_velocity']:.2f}m/s "
+                          f"new_p_viol={len(rep.get('new_pressure_violations', []))} "
+                          f"dP={rep['fidelity']['mean_abs_pressure_delta_m']:.2f}m")
 
     label = f"_{args.label}" if args.label else ""
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
