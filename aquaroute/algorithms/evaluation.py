@@ -262,12 +262,10 @@ def get_benchmark_networks() -> Dict[str, WaterNetwork]:
         for i in range(1, 4):
             net = WaterNetwork()
             net.add_reservoir(i - 1, capacity=100.0, supply=100.0)
-            last = None
             for j in range(3):
                 cid = i * 3 + j
                 net.add_community(cid, demand=20.0 * (j + 1), priority=j + 1)
                 net.add_pipeline(i - 1, cid, 50.0, 1.0)
-                last = cid
             benchmark_networks[f"sample_{i}"] = net
 
     return benchmark_networks
@@ -293,21 +291,48 @@ class EvaluationSuite:
                  scenarios: Optional[List[Dict]] = None,
                  seed: int = 42):
         self.network = network
+        self._assign_demand_priorities()
         self.approaches = approaches or self._default_approaches()
         self.scenarios = scenarios or self._default_scenarios()
         self.seed = seed
         self.results: Dict[str, List[Dict]] = {}
 
+    def _assign_demand_priorities(self) -> None:
+        """Assign demand-based criticality tiers when no priority data exist.
+
+        EPANET benchmarks carry no priority information.  As a transparent
+        modelling choice we treat the largest-demand communities as the most
+        critical (serving more people): the top quartile gets priority 0, the
+        second quartile priority 1, and the remainder priority 2.  Existing
+        non-uniform priorities are preserved.
+        """
+        communities = self.network.get_communities()
+        if not communities:
+            return
+        levels = {self.network.G.nodes[c].get("priority", 0) for c in communities}
+        if len(levels) > 1:
+            return  # real priority data already present
+        ranked = sorted(
+            ((self.network.G.nodes[c].get("demand", 0.0), c) for c in communities),
+            reverse=True,
+        )
+        ranked = [(d, c) for d, c in ranked if d > 0]
+        n = len(ranked)
+        for rank, (_, c) in enumerate(ranked):
+            frac = rank / n if n else 0.0
+            self.network.G.nodes[c]["priority"] = 0 if frac < 0.25 else (
+                1 if frac < 0.5 else 2)
+
     def _default_approaches(self) -> List[Tuple[str, Dict]]:
         priority = _priority_communities(self.network)
         # Scale the minimum-service guarantee to the network's demand units so
         # it remains feasible on real EPANET networks (demands ~1e-3 m3/s) as
-        # well as synthetic networks (demands ~10-100).  Guarantee 25% of the
-        # smallest positive priority demand.
+        # well as synthetic networks (demands ~10-100).  Guarantee a 60% floor
+        # for priority (largest-demand) communities under stress.
         prio_demands = [self.network.G.nodes[c].get("demand", 0.0)
                         for c in priority
                         if self.network.G.nodes[c].get("demand", 0.0) > 0]
-        min_allocation = 0.25 * min(prio_demands) if prio_demands else 0.0
+        min_allocation = 0.60 * min(prio_demands) if prio_demands else 0.0
         return [
             # Baseline A: classic shortage minimisation (maximise delivered water).
             ("baseline_A_shortage_min", {"strategy": "shortage_min"}),
@@ -428,6 +453,22 @@ class EvaluationSuite:
             jains_fairness_volume = jains_fairness_index(alloc_map, demands, normalized=False)
         delivery_cost = solution.get("delivery_cost", 0.0)
 
+        # Priority-weighted service ratio: weight each community by its
+        # criticality tier (higher priority = larger weight) and average the
+        # served fraction.  1.0 means all priority demand is fully served.
+        priorities = {c: network.G.nodes[c].get("priority", 0)
+                      for c in demands if demands.get(c, 0) > 0}
+        if priorities:
+            max_p = max(priorities.values())
+            weights = {c: (max_p - p + 1) for c, p in priorities.items()}
+            wsum = sum(weights.values())
+            priority_service = sum(
+                weights[c] * min(1.0, alloc_map.get(c, 0.0) / demands[c])
+                for c in priorities
+            ) / wsum
+        else:
+            priority_service = 1.0
+
         # Objective value using default weights
         alpha, beta, gamma = 1.0, 1.0, 1.0
         objective_value = alpha * shortage + beta * fairness + gamma * delivery_cost
@@ -442,6 +483,7 @@ class EvaluationSuite:
         metrics["fairness"] = fairness
         metrics["jains_fairness"] = jains_fairness
         metrics["jains_fairness_volume"] = jains_fairness_volume
+        metrics["priority_service"] = priority_service
         metrics["delivery_cost"] = delivery_cost
         metrics["objective_value"] = objective_value
         metrics["runtime"] = runtime
@@ -539,6 +581,7 @@ class EvaluationSuite:
                             "fairness": 0.0,
                             "jains_fairness": 1.0,
                             "jains_fairness_volume": 1.0,
+                            "priority_service": 0.0,
                             "delivery_cost": 0.0,
                             "cvar": 0.0,
                             "objective_value": float("nan"),
@@ -615,11 +658,12 @@ class EvaluationSuite:
             ["approach", "scenario_type", "repeat", "n_repeats",
              "n_communities", "n_reservoirs"]
             + [f"alloc_{c}" for c in sorted(all_communities)]
-            + ["shortage", "shortage_std", "fairness", "fairness_std",
-               "jains_fairness", "jains_fairness_std",
-               "jains_fairness_volume", "jains_fairness_volume_std",
-               "delivery_cost", "delivery_cost_std",
-               "cvar", "cvar_std", "objective_value", "runtime", "status", "solver"]
+             + ["shortage", "shortage_std", "fairness", "fairness_std",
+                "jains_fairness", "jains_fairness_std",
+                "jains_fairness_volume", "jains_fairness_volume_std",
+                "priority_service", "priority_service_std",
+                "delivery_cost", "delivery_cost_std",
+                "cvar", "cvar_std", "objective_value", "runtime", "status", "solver"]
         )
 
         with open(filepath, "w", newline="") as fh:
@@ -645,6 +689,7 @@ class EvaluationSuite:
                     for key in ("shortage", "shortage_std", "fairness", "fairness_std",
                                 "jains_fairness", "jains_fairness_std",
                                 "jains_fairness_volume", "jains_fairness_volume_std",
+                                "priority_service", "priority_service_std",
                                 "delivery_cost", "delivery_cost_std", "cvar", "cvar_std",
                                 "objective_value", "runtime", "status", "solver"):
                         row[key] = r.get(key, "")
@@ -672,11 +717,13 @@ class EvaluationSuite:
                     "allocations": r.get("allocations", {}),
                 }
                 for k in ("shortage", "fairness", "jains_fairness",
-                          "jains_fairness_volume", "delivery_cost", "cvar",
+                          "jains_fairness_volume", "priority_service",
+                          "delivery_cost", "cvar",
                           "objective_value", "runtime", "status", "solver"):
                     entry[k] = r.get(k)
                 for k in ("shortage", "fairness", "jains_fairness",
-                          "jains_fairness_volume", "delivery_cost", "cvar"):
+                          "jains_fairness_volume", "priority_service",
+                          "delivery_cost", "cvar"):
                     std_key = f"{k}_std"
                     if std_key in r:
                         entry[std_key] = r.get(std_key)
@@ -688,7 +735,8 @@ class EvaluationSuite:
                             "repeat": rr.get("repeat", i),
                             **{k: rr.get(k) for k in
                                ("shortage", "fairness", "jains_fairness",
-                                "jains_fairness_volume", "delivery_cost", "cvar",
+                                "jains_fairness_volume", "priority_service",
+                                "delivery_cost", "cvar",
                                 "objective_value", "runtime", "status")},
                         }
                         for i, rr in enumerate(raw)
@@ -713,6 +761,7 @@ class EvaluationSuite:
             return {}
         try:
             from aquaroute.algorithms.hydraulics import HydraulicValidator
+
             from .uncertainty import apply_scenario
             validator = HydraulicValidator(self.network, metadata)
         except Exception:
@@ -775,6 +824,7 @@ class EvaluationSuite:
             jains_vals = raw_col("jains_fairness") or col("jains_fairness")
             jains_vol_vals = (raw_col("jains_fairness_volume")
                               or col("jains_fairness_volume"))
+            priority_vals = raw_col("priority_service") or col("priority_service")
             costs = raw_col("delivery_cost") or col("delivery_cost")
             cvar_vals = raw_col("cvar") or col("cvar")
             runtimes = raw_col("runtime") or col("runtime")
@@ -805,6 +855,12 @@ class EvaluationSuite:
                                               if jains_vol_vals else 1.0),
                 "std_jains_fairness_volume": (float(np.std(jains_vol_vals, ddof=1))
                                               if len(jains_vol_vals) > 1 else 0.0),
+
+                # Priority-weighted service
+                "avg_priority_service": (float(np.mean(priority_vals))
+                                         if priority_vals else 0.0),
+                "std_priority_service": (float(np.std(priority_vals, ddof=1))
+                                         if len(priority_vals) > 1 else 0.0),
 
                 # Cost statistics
                 "avg_cost": float(np.mean(costs)) if costs else 0.0,
@@ -1188,81 +1244,88 @@ class EvaluationSuite:
         matplotlib.use('Agg')
         import matplotlib.pyplot as plt
 
-        # Colorblind-safe palette
+        # Colorblind-safe (Okabe-Ito) palette
         cb_palette = [
-            '#0173B2', '#DE8F05', '#029E73', '#56B4E9', '#E07A5F',
-            '#EDC949', '#7876B1', '#43AA8B', '#DDAA9H', '#7B4173'
+            '#0072B2', '#E69F00', '#009E73', '#CC79A7', '#D55E00',
+            '#56B4E9', '#F0E442', '#000000',
         ]
-
 
         if approaches is None:
             approaches = list(self.results.keys())
 
-# Collect data
+        # Collect per-repeat observations for the requested metric.
         means = []
         cis = []
         stds = []
+        counts = []
 
         for approach in approaches:
-            if approach not in self.results:
-                means.append(np.nan)
-                cis.append((np.nan, np.nan))
-                stds.append(np.nan)
-                continue
-
-            # Extract metric values across repeats
-            # results[approach] is a list of dicts (one per repeat, from _average_repeats)
             values = []
-            for r in self.results[approach]:
-                if isinstance(r, dict) and 'shortage' in r:
-                    values.append(float(r['shortage']))
+            if approach in self.results:
+                for r in self.results[approach]:
+                    raw = r.get("repeats_raw") if isinstance(r, dict) else None
+                    if raw:
+                        values.extend(float(rr[metric]) for rr in raw
+                                      if isinstance(rr.get(metric), (int, float))
+                                      and np.isfinite(rr.get(metric)))
+                    elif isinstance(r, dict) and isinstance(r.get(metric), (int, float)) \
+                            and np.isfinite(r.get(metric)):
+                        values.append(float(r[metric]))
 
             if values:
-                mean_val = np.mean(values)
-                std_val = np.std(values, ddof=1) if len(values) > 1 else 0.0
-                # Bootstrap CI
-                mean_boot, ci_low, ci_up = self.bootstrap_ci(values, alpha=0.05)
+                mean_val = float(np.mean(values))
+                std_val = float(np.std(values, ddof=1)) if len(values) > 1 else 0.0
+                _, ci_low, ci_up = self.bootstrap_ci(values, alpha=0.05)
                 means.append(mean_val)
                 cis.append((ci_low, ci_up))
                 stds.append(std_val)
+                counts.append(len(values))
             else:
                 means.append(np.nan)
                 cis.append((np.nan, np.nan))
                 stds.append(np.nan)
+                counts.append(0)
 
         # Create plot
-        fig, ax = plt.subplots(figsize=figsize, dpi=dpi)
+        fig, ax = plt.subplots(figsize=figsize, dpi=dpi, constrained_layout=True)
 
         x_pos = np.arange(len(approaches))
-        colors = cb_palette[:len(approaches)]
+        colors = [cb_palette[i % len(cb_palette)] for i in range(len(approaches))]
 
-        # Plot bars
-        bars = ax.bar(x_pos, means, yerr=[[m - ci[0] for ci, m in zip(cis, means)],
-                                              [ci[1] - m for ci, m in zip(cis, means)]],
-                      capsize=5, color=colors, error_kw={'linewidth': 1.5, 'capthick': 1.5},
-                      alpha=0.8)
+        means_arr = np.array(means, dtype=float)
+        err = np.nan_to_num(
+            np.array([[m - ci[0] for ci, m in zip(cis, means)],
+                      [ci[1] - m for ci, m in zip(cis, means)]]), nan=0.0)
 
-        # Add value labels
-        for bar, mean_val in zip(bars, means):
+        ax.bar(x_pos, means_arr, yerr=err, capsize=5, color=colors,
+               edgecolor='black', linewidth=0.6,
+               error_kw={'linewidth': 1.2, 'capthick': 1.2}, alpha=0.9)
+
+        # Value labels placed above the upper CI whisker.
+        for i, mean_val in enumerate(means_arr):
             if not np.isnan(mean_val):
-                ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.01,
-                       f'{mean_val:.3f}', ha='center', va='bottom', fontsize=8)
+                y = mean_val + err[1, i]
+                ax.annotate(f'{mean_val:.3f}', xy=(x_pos[i], y),
+                            xytext=(0, 4), textcoords='offset points',
+                            ha='center', va='bottom', fontsize=8)
 
         # Formatting
         ax.set_xlabel(xlabel, fontsize=12)
         ax.set_ylabel(ylabel, fontsize=12)
-        ax.set_title(title, fontsize=14)
+        ax.set_title(title, fontsize=13)
         ax.set_xticks(x_pos)
-        ax.set_xticklabels(approaches, rotation=45, ha='right', fontsize=10)
-        ax.grid(axis='y', linestyle='--', alpha=0.7)
+        ax.set_xticklabels([a.replace("_", "\n") for a in approaches],
+                           rotation=0, ha='center', fontsize=8.5)
+        ax.grid(axis='y', linestyle=':', alpha=0.7)
+        ax.set_axisbelow(True)
 
-        # Add sample size annotations
-        for i, (mean_val, std_val) in enumerate(zip(means, stds)):
-            if not np.isnan(mean_val) and not np.isnan(std_val):
-                ax.text(i, mean_val + 0.05, f'n={len(self.results[approaches[i]]) if approaches[i] in self.results else 0}',
-                       ha='center', va='bottom', fontsize=7, style='italic')
-
-        plt.tight_layout()
+        # Sample-size annotations in the lower margin, away from labels.
+        for i, n_i in enumerate(counts):
+            if n_i:
+                ax.annotate(f'n={n_i}', xy=(x_pos[i], 0),
+                            xycoords=('data', 'axes fraction'),
+                            xytext=(0, -34), textcoords='offset points',
+                            ha='center', va='top', fontsize=7, style='italic')
 
         if save_path:
             plt.savefig(save_path, dpi=dpi, bbox_inches='tight')

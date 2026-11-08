@@ -58,20 +58,21 @@ def main(argv=None) -> int:
     summary = suite.compute_summary_metrics()
     print(f"\nCompleted in {elapsed:.2f}s.\n")
     header = (f"{'approach':<34}{'shortage':>11}{'fairness':>10}"
-              f"{'jain_S':>9}{'jain_V':>9}{'cost':>10}{'feas%':>8}")
+              f"{'jain_S':>9}{'prio_svc':>10}{'cost':>10}{'feas%':>8}")
     print(header)
     print("-" * len(header))
     for name, m in summary.items():
         print(f"{name:<34}{m['avg_shortage']:>11.5f}{m['avg_fairness']:>10.4f}"
               f"{m.get('avg_jains_fairness', 0.0):>9.4f}"
-              f"{m.get('avg_jains_fairness_volume', 0.0):>9.4f}"
+              f"{m.get('avg_priority_service', 0.0):>10.4f}"
               f"{m['avg_cost']:>10.4f}{100 * m['feasibility_rate']:>8.1f}")
 
     # Statistical comparison of AquaRoute against each baseline.
     significance = {}
     aqua = "aquaroute_weighted_min_service"
     if aqua in self_approach_names(results):
-        for metric in ("shortage", "fairness", "jains_fairness", "delivery_cost"):
+        for metric in ("shortage", "fairness", "jains_fairness",
+                       "priority_service", "delivery_cost"):
             significance[metric] = {}
             for other in results:
                 if other == aqua:
