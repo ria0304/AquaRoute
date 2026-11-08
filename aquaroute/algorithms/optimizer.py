@@ -827,10 +827,19 @@ class AllocationOptimizer:
             inflow = sum(m.f[u, n] for u in self._pred[n] if (u, n) in cap)
             outflow = sum(m.f[n, v] for v in self._succ[n] if (n, v) in cap)
             if n in self._sup_nodes:
-                return outflow - inflow <= self.network.G.nodes[n].get("supply", float("inf"))
+                expr = outflow - inflow <= self.network.G.nodes[n].get("supply", float("inf"))
+                if expr is True or expr is False:
+                    return Constraint.Skip
+                return expr
             if n in self._in_nodes:
-                return inflow - outflow == m.x[n]
-            return inflow - outflow == 0
+                expr = inflow - outflow == m.x[n]
+                if expr is True or expr is False:
+                    return Constraint.Skip
+                return expr
+            expr = inflow - outflow == 0
+            if expr is True or expr is False:
+                return Constraint.Skip
+            return expr
 
         model.node_balance = Constraint(list(self.network.G.nodes()), rule=_balance)
 

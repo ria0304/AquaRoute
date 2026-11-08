@@ -374,14 +374,21 @@ class EvaluationSuite:
             opt = AllocationOptimizer(network=network, **kwargs)
             solution = opt.solve(allow_fallback=True)
             if solution is not None and solution.get("allocations"):
-                # Propagate real solver metrics from the optimizer solution
-                solution["solver"] = opt.solution.get("solver", "unknown") if opt.solution else "unknown"
-                solution["status"] = opt.solution.get("status", "optimal") if opt.solution else "optimal"
-                solution["runtime"] = opt.runtime if opt.runtime else 0.0
-                solution["delivery_cost"] = opt.solution.get("delivery_cost", 0.0) if opt.solution else 0.0
-                solution["validation_passed"] = opt.solution.get("validation_passed", True) if opt.solution else True
-                solution["validation_errors"] = opt.solution.get("validation_errors", []) if opt.solution else []
-                solution["validation_warnings"] = opt.solution.get("validation_warnings", []) if opt.solution else []
+                # Use get_results() which computes full metrics from the solution
+                results = opt.get_results()
+                # Propagate real solver metrics from the optimizer results
+                # into the solution dict so _compute_all_metrics can find them
+                solution["solver"] = results.get("solver", opt.solution.get("solver", "unknown") if opt.solution else "unknown")
+                solution["status"] = results.get("status", "optimal")
+                solution["runtime"] = results.get("runtime", 0.0)
+                solution["delivery_cost"] = results.get("delivery_cost", 0.0)
+                solution["validation_passed"] = results.get("validation_passed", True)
+                solution["validation_errors"] = results.get("validation_errors", [])
+                solution["validation_warnings"] = results.get("validation_warnings", [])
+                solution["shortage"] = results.get("shortage")
+                solution["fairness"] = results.get("fairness")
+                solution["jains_fairness"] = results.get("jains_fairness")
+                solution["objective_value"] = results.get("objective_value")
             return solution
         except Exception as e:
             import traceback
@@ -408,9 +415,15 @@ class EvaluationSuite:
         metrics = {}
 
         # Basic metrics from the optimizer solution (preferred) or compute them
-        shortage = allocations.get("shortage", compute_shortage(allocations, demands))
-        fairness = allocations.get("fairness", compute_fairness(allocations, demands))
-        jains_fairness = allocations.get("jains_fairness", jains_fairness_index(allocations, demands))
+        shortage = allocations.get("shortage")
+        if shortage is None:
+            shortage = compute_shortage(allocations, demands)
+        fairness = allocations.get("fairness")
+        if fairness is None:
+            fairness = compute_fairness(allocations, demands)
+        jains_fairness = allocations.get("jains_fairness")
+        if jains_fairness is None:
+            jains_fairness = jains_fairness_index(allocations, demands)
         delivery_cost = allocations.get("delivery_cost", 0.0)
 
         # Objective value using default weights
@@ -498,7 +511,7 @@ class EvaluationSuite:
                     if solution and solution.get("allocations"):
                         demands_c = {c: net_copy.G.nodes[c]["demand"]
                                     for c in net_copy.get_communities()}
-                        metrics = self._compute_all_metrics(net_copy, solution["allocations"], demands_c)
+                        metrics = self._compute_all_metrics(net_copy, solution, demands_c)
                         metrics["approach"] = approach_name
                         metrics["scenario_type"] = scenario.get("scenario_type", "unknown")
                         metrics["repeat"] = repeat_idx
@@ -866,6 +879,272 @@ class EvaluationSuite:
                 f"with {power*100:.0f}% power at {alpha*100:.0f}% significance"
             ),
         }
+
+    def bootstrap_ci(self, data: List[float], alpha: float = 0.05, n_bootstraps: int = 1000) -> Tuple[float, float, float]:
+        """Compute bootstrap confidence interval for the mean.
+
+        Parameters
+        ----------
+        data : list of float
+            Sample data.
+        alpha : float, optional
+            Significance level. Default 0.05.
+        n_bootstraps : int, optional
+            Number of bootstrap samples. Default 1000.
+
+        Returns
+        -------
+        tuple of (mean, lower_ci, upper_ci)
+        """
+        import numpy as np
+
+        data = np.array(data, dtype=float)
+        n = len(data)
+        boot_means = np.empty(n_bootstraps)
+
+        rng = np.random.default_rng(42)
+        for i in range(n_bootstraps):
+            sample = rng.choice(data, size=n, replace=True)
+            boot_means[i] = np.mean(sample)
+
+        lower_percentile = (alpha / 2) * 100
+        upper_percentile = (1 - alpha / 2) * 100
+        mean = np.mean(data)
+        ci_lower = np.percentile(boot_means, lower_percentile)
+        ci_upper = np.percentile(boot_means, upper_percentile)
+
+        return float(mean), float(ci_lower), float(ci_upper)
+
+    def cliffs_delta(self, data_a: List[float], data_b: List[float]) -> Tuple[float, str]:
+        """Compute Cliff's delta effect size between two independent samples.
+
+        Parameters
+        ----------
+        data_a : list of float
+            First sample.
+        data_b : list of float
+            Second sample.
+
+        Returns
+        -------
+        tuple of (delta, interpretation)
+            Cliff's delta ranges: [-1, 1], where:
+            - abs(delta) < 0.147: negligible
+            - 0.147 <= abs(delta) < 0.33: small
+            - 0.33 <= abs(delta) < 0.474: medium
+            - abs(delta) >= 0.474: large
+            sign(delta) indicates which sample tends to have larger values.
+        """
+        import numpy as np
+
+        data_a = np.array(data_a, dtype=float)
+        data_b = np.array(data_b, dtype=float)
+
+        # Count how many times a > b and a < b
+        n_a, n_b = len(data_a), len(data_b)
+        greater = 0
+        less = 0
+
+        for val_a in data_a:
+            for val_b in data_b:
+                if val_a > val_b:
+                    greater += 1
+                elif val_a < val_b:
+                    less += 1
+
+        delta = (greater - less) / (n_a * n_b) if n_a * n_b > 0 else 0.0
+
+        # Interpretation
+        abs_delta = abs(delta)
+        if abs_delta < 0.147:
+            interpretation = "negligible"
+        elif abs_delta < 0.33:
+            interpretation = "small"
+        elif abs_delta < 0.474:
+            interpretation = "medium"
+        else:
+            interpretation = "large"
+
+        return float(delta), interpretation
+
+    def wilcoxon_paired_test(self, data_a: List[float], data_b: List[float]) -> Dict[str, float]:
+        """Perform Wilcoxon signed-rank test for paired samples.
+
+        Parameters
+        ----------
+        data_a : list of float
+            First sample (paired with data_b).
+        data_b : list of float
+            Second sample (paired with data_a).
+
+        Returns
+        -------
+        dict with test statistics:
+            - statistic: Wilcoxon test statistic (T)
+            - p_value: two-sided p-value
+            - mean_diff: mean of differences (data_a - data_b)
+        """
+        import numpy as np
+        from scipy.stats import wilcoxon
+
+        data_a = np.array(data_a, dtype=float)
+        data_b = np.array(data_b, dtype=float)
+
+        # Ensure equal length by trimming to minimum
+        n = min(len(data_a), len(data_b))
+        data_a = data_a[:n]
+        data_b = data_b[:n]
+
+        # Compute differences
+        diffs = data_a - data_b
+        mean_diff = float(np.mean(diffs))
+
+        # Wilcoxon test (only non-zero differences)
+        non_zero_diffs = diffs[np.abs(diffs) > 1e-10]
+
+        if len(non_zero_diffs) == 0:
+            return {
+                "statistic": 0.0,
+                "p_value": 1.0,
+                "mean_diff": mean_diff,
+            }
+
+        try:
+            stat, p_value = wilcoxon(non_zero_diffs)
+            return {
+                "statistic": float(stat),
+                "p_value": float(p_value),
+                "mean_diff": mean_diff,
+            }
+        except Exception:
+            return {
+                "statistic": float(np.sum(np.sign(diffs))),
+                "p_value": 1.0,
+                "mean_diff": mean_diff,
+            }
+
+    def plot_results(self, metric: str = "shortage",
+                     approaches: Optional[List[str]] = None,
+                     scenario: str = "normal",
+                     xlabel: str = "Approach",
+                     ylabel: str = "Shortage (lps)",
+                     title: str = "Comparison of Optimization Approaches",
+                     save_path: Optional[str] = None,
+                     figsize: Tuple[int, int] = (10, 6),
+                     dpi: int = 300) -> None:
+        """Plot comparison results with colorblind-safe palette.
+
+        Creates a publication-ready bar plot with mean +/- bootstrap CI
+        for the specified metric across approaches.
+
+        Parameters
+        ----------
+        metric : str, optional
+            Metric to plot. Default "shortage".
+        approaches : list of str, optional
+            List of approach names. If None, uses all approaches.
+        scenario : str, optional
+            Scenario type for labeling. Default "normal".
+        xlabel : str, optional
+            X-axis label. Default "Approach".
+        ylabel : str, optional
+            Y-axis label. Default "Shortage (lps)".
+        title : str, optional
+            Plot title. Default "Comparison of Optimization Approaches".
+        save_path : str, optional
+            Path to save figure. If None, shows the plot.
+        figsize : tuple of int, optional
+            Figure size. Default (10, 6).
+        dpi : int, optional
+            Dots per inch. Default 300.
+        """
+        import numpy as np
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+
+        # Colorblind-safe palette
+        cb_palette = [
+            '#0173B2', '#DE8F05', '#029E73', '#56B4E9', '#E07A5F',
+            '#EDC949', '#7876B1', '#43AA8B', '#DDAA9H', '#7B4173'
+        ]
+
+        from .evaluation import EvaluationSuite
+
+        if approaches is None:
+            approaches = list(self.results.keys())
+
+# Collect data
+        means = []
+        cis = []
+        stds = []
+
+        for approach in approaches:
+            if approach not in self.results:
+                means.append(np.nan)
+                cis.append((np.nan, np.nan))
+                stds.append(np.nan)
+                continue
+
+            # Extract metric values across repeats
+            # results[approach] is a list of dicts (one per repeat, from _average_repeats)
+            values = []
+            for r in self.results[approach]:
+                if isinstance(r, dict) and 'shortage' in r:
+                    values.append(float(r['shortage']))
+
+            if values:
+                mean_val = np.mean(values)
+                std_val = np.std(values, ddof=1) if len(values) > 1 else 0.0
+                # Bootstrap CI
+                mean_boot, ci_low, ci_up = self.bootstrap_ci(values, alpha=0.05)
+                means.append(mean_val)
+                cis.append((ci_low, ci_up))
+                stds.append(std_val)
+            else:
+                means.append(np.nan)
+                cis.append((np.nan, np.nan))
+                stds.append(np.nan)
+
+        # Create plot
+        fig, ax = plt.subplots(figsize=figsize, dpi=dpi)
+
+        x_pos = np.arange(len(approaches))
+        colors = cb_palette[:len(approaches)]
+
+        # Plot bars
+        bars = ax.bar(x_pos, means, yerr=[[m - ci[0] for ci, m in zip(cis, means)],
+                                              [ci[1] - m for ci, m in zip(cis, means)]],
+                      capsize=5, color=colors, error_kw={'linewidth': 1.5, 'capthick': 1.5},
+                      alpha=0.8)
+
+        # Add value labels
+        for bar, mean_val in zip(bars, means):
+            if not np.isnan(mean_val):
+                ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.01,
+                       f'{mean_val:.3f}', ha='center', va='bottom', fontsize=8)
+
+        # Formatting
+        ax.set_xlabel(xlabel, fontsize=12)
+        ax.set_ylabel(ylabel, fontsize=12)
+        ax.set_title(title, fontsize=14)
+        ax.set_xticks(x_pos)
+        ax.set_xticklabels(approaches, rotation=45, ha='right', fontsize=10)
+        ax.grid(axis='y', linestyle='--', alpha=0.7)
+
+        # Add sample size annotations
+        for i, (mean_val, std_val) in enumerate(zip(means, stds)):
+            if not np.isnan(mean_val) and not np.isnan(std_val):
+                ax.text(i, mean_val + 0.05, f'n={len(self.results[approaches[i]]) if approaches[i] in self.results else 0}',
+                       ha='center', va='bottom', fontsize=7, style='italic')
+
+        plt.tight_layout()
+
+        if save_path:
+            plt.savefig(save_path, dpi=dpi, bbox_inches='tight')
+            plt.close(fig)
+        else:
+            plt.show()
 
     def sensitivity_analysis(self, metric: str = "shortage", approach: Optional[str] = None,
                               param: str = "alpha", values: Optional[List[float]] = None) -> Dict:
