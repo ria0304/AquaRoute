@@ -1037,7 +1037,7 @@ class AllocationOptimizer:
             and ``allocations`` averaged across scenarios.
         """
         import time
-        from aquaroute.algorithms.uncertainty import ScenarioGenerator, apply_scenario
+
 
         start = time.time()
         strategy = strategy or self.strategy
@@ -1171,6 +1171,7 @@ class AllocationOptimizer:
             and shortage metrics.
         """
         import time
+
         import numpy as np
 
         start = time.time()
@@ -1199,10 +1200,9 @@ class AllocationOptimizer:
 
         # Get community and reservoir info
         communities = self.network.get_communities()
-        reservoirs = self.network.get_reservoirs()
+        self.network.get_reservoirs()
         base_demands = {c: self.network.G.nodes[c]["demand"]
                        for c in communities}
-                      for r in reservoirs}
 
         # Allocate period demands across communities using the strategy
         period_allocations = {}

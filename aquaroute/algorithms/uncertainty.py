@@ -167,7 +167,7 @@ class FailureAnalyzer:
         # Reoptimize allocation for post-failure state
         opt_post = optimizer_class(network=net_copy, **optimizer_kwargs)
         try:
-            solution_post = opt_post.solve(allow_fallback=True)
+            opt_post.solve(allow_fallback=True)
             post_failure = opt_post.get_results() if opt_post.solution else {}
         except Exception:
             post_failure = {}
