@@ -218,13 +218,34 @@ def get_benchmark_networks() -> Dict[str, WaterNetwork]:
     try:
         import wntr
 
-        # EPANET benchmark networks
-        networks_dir = "/home/user/.local/lib/python3.14/site-packages/wntr/library/networks/"
-        import os
+        # EPANET benchmark networks - search for wntr's bundled networks
+        networks_dir = None
+        # Try common locations
+        import pathlib
+        possible_paths = [
+            pathlib.Path(wntr.__file__).parent / "library" / "networks",
+            pathlib.Path("/home/user/.local/lib/python3.14/site-packages/wntr/library/networks"),
+            pathlib.Path("/usr/local/share/wntr/networks"),
+        ]
+        for p in possible_paths:
+            if p.is_dir():
+                networks_dir = p
+                break
+
+        if networks_dir is None:
+            # Try to find any directory with EPANET .inp files
+            import glob
+            for p in pathlib.Path().rglob("*.inp"):
+                networks_dir = p.parent
+                if any(f.name.startswith("Net") for f in networks_dir.glob("*.inp")):
+                    break
+
+        if networks_dir is None:
+            raise ImportError("No EPANET benchmark networks found")
 
         for net_name in ["Net1", "Net2", "Net3"]:
-            inp_file = os.path.join(networks_dir, f"{net_name}.inp")
-            if os.path.exists(inp_file):
+            inp_file = networks_dir / f"{net_name}.inp"
+            if inp_file.exists():
                 wn = wntr.network.WaterNetworkModel(inp_file)
                 # Convert to AquaRoute WaterNetwork
                 net = WaterNetwork()
@@ -454,6 +475,7 @@ class EvaluationSuite:
                         metrics["repeat"] = repeat_idx
                         metrics["n_communities"] = len(net_copy.get_communities())
                         metrics["n_reservoirs"] = len(net_copy.get_reservoirs())
+                        metrics["results"] = metrics
                     else:
                         metrics = {
                             "approach": approach_name,
@@ -470,6 +492,7 @@ class EvaluationSuite:
                             "runtime": 0.0,
                             "status": "failed",
                             "solver": "unknown",
+                            "results": metrics,
                         }
 
                     repeats.append(metrics)
@@ -850,7 +873,11 @@ class EvaluationSuite:
 
         out = {}
         for val in values:
-            kwargs = dict(matching[0] if matching else {})
+            # matching[0] is a (name, kwargs) tuple; extract the kwargs dict
+            if isinstance(matching[0], tuple) and len(matching[0]) == 2:
+                kwargs = dict(matching[0][1])
+            else:
+                kwargs = dict(matching[0] if matching else {})
             kwargs[param] = float(val)
 
             net_copy = self._copy_network()

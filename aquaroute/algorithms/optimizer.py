@@ -179,18 +179,18 @@ def check_hydraulic_feasibility(
         for node_id in wn.junction_name_list:
             try:
                 h = float(node_results["head"][node_id])
-                pressures[int(node_id)] = h
+                pressures[node_id] = h
             except (KeyError, IndexError, TypeError):
-                pressures[int(node_id)] = 0.0
+                pressures[node_id] = 0.0
 
         # Get link flows
         flows = {}
         for link_id in wn.pipe_name_list:
             try:
                 f = float(link_results["flowrate"][link_id])
-                flows[int(link_id)] = f
+                flows[link_id] = f
             except (KeyError, IndexError, TypeError):
-                flows[int(link_id)] = 0.0
+                flows[link_id] = 0.0
 
         # Compute statistics
         all_pressures = [p for p in pressures.values() if np.isfinite(p)]
