@@ -6,10 +6,10 @@ import math
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
-import pandas as pd
 
-from aquaroute.models.water_network import WaterNetwork
 from aquaroute.algorithms.optimizer import AllocationOptimizer, compute_fairness, compute_shortage
+from aquaroute.models.water_network import WaterNetwork
+
 from .uncertainty import ScenarioGenerator
 
 
@@ -234,7 +234,6 @@ def get_benchmark_networks() -> Dict[str, WaterNetwork]:
 
         if networks_dir is None:
             # Try to find any directory with EPANET .inp files
-            import glob
             for p in pathlib.Path().rglob("*.inp"):
                 networks_dir = p.parent
                 if any(f.name.startswith("Net") for f in networks_dir.glob("*.inp")):
@@ -288,7 +287,7 @@ def get_benchmark_networks() -> Dict[str, WaterNetwork]:
 
     except ImportError:
         pass  # wntr not available
-    except Exception as e:
+    except Exception:
         pass  # Skip on error
 
     # Add sample networks if no EPANET networks available
@@ -624,7 +623,6 @@ class EvaluationSuite:
 
         Includes all enhanced metrics plus metadata about the evaluation run.
         """
-        import json
 
         if not results:
             return
@@ -1058,8 +1056,8 @@ class EvaluationSuite:
         dpi : int, optional
             Dots per inch. Default 300.
         """
-        import numpy as np
         import matplotlib
+        import numpy as np
         matplotlib.use('Agg')
         import matplotlib.pyplot as plt
 
@@ -1069,7 +1067,6 @@ class EvaluationSuite:
             '#EDC949', '#7876B1', '#43AA8B', '#DDAA9H', '#7B4173'
         ]
 
-        from .evaluation import EvaluationSuite
 
         if approaches is None:
             approaches = list(self.results.keys())

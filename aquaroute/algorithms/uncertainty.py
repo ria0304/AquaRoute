@@ -171,7 +171,6 @@ class FailureAnalyzer:
             post_failure = opt_post.get_results() if opt_post.solution else {}
         except Exception:
             post_failure = {}
-            solution_post = None
 
         # Run multiple recovery scenarios with demand/supply variation
         recovery_scenarios = []

@@ -1202,7 +1202,6 @@ class AllocationOptimizer:
         reservoirs = self.network.get_reservoirs()
         base_demands = {c: self.network.G.nodes[c]["demand"]
                        for c in communities}
-        base_supply = {r: self.network.G.nodes[r].get("supply", float("inf"))
                       for r in reservoirs}
 
         # Allocate period demands across communities using the strategy

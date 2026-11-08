@@ -2,13 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import pathlib
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
-import numpy as np
 import wntr
 
 from aquaroute.models.water_network import WaterNetwork
-
 
 __all__ = ["load_epanet_inp", "to_wntr", "EpinetMetadata"]
 
@@ -151,7 +149,9 @@ def load_epanet_inp(
         network.add_community(node_id=aro_id, demand=base, priority=1)
 
     # All demands are derived from EPANET time series base_values; no arbitrary
-    # inflation (e.g. 10.0 default) is applied. Zeros are explicit, not invented.# --- Pipes ---
+    # inflation (e.g. 10.0 default) is applied. Zeros are explicit, not invented.
+    metadata["preserved"].setdefault("junctions", [])
+    metadata["preserved"]["junctions"].extend(preserved_junc)# --- Pipes ---
     preserved_pipe = []
     for pipe_name in wn.pipe_name_list:
         try:
@@ -219,7 +219,7 @@ def load_epanet_inp(
                     from_node=res_aro,
                     to_node=res_end_aro,
                     capacity=float('inf'),
-                    delivery_cost=1.0 if opt_cost_formula is None else None,
+                    delivery_cost=1.0 if cost_formula is None else None,
                 )
         except Exception:
             pass
@@ -236,29 +236,34 @@ def load_epanet_inp(
         try:
             res_link = wn.get_link(res_name)
             downstream_names = [res_link.end_node_name]
-            # Also check connected pipes from the reservoir
-            for pipe_name in wn.pipe_name_list:
-                try:
-                    p = wn.get_link(pipe_name)
-                    if p.start_node_name == res_name:
-                        downstream_names.append(p.end_node_name)
-                except Exception:
-                    pass
-            # Map each downstream to Aro ID and add pipeline
-            for down_name in downstream_names:
-                down_aro = wntr_to_aro.get(down_name, -1)
-                if down_aro >= 0 and down_aro != res_aro:
-                    # Check this edge doesn't already exist
-                    edge_key = (min(res_aro, down_aro), max(res_aro, down_aro))
-                    # Add pipeline with infinite capacity
-                    network.add_pipeline(
-                        from_node=res_aro,
-                        to_node=down_aro,
-                        capacity=float('inf'),
-                        delivery_cost=1.0 if cost_formula is None else None,
-                    )
         except Exception:
-            metadata["preserved"]["pipes"] = preserved_pipe
+            downstream_names = []
+        # Also check connected pipes from the reservoir
+        try:
+            for pipe_name in wn.pipe_name_list:
+                p = wn.get_link(pipe_name)
+                if p.start_node_name == res_name:
+                    downstream_names.append(p.end_node_name)
+        except Exception:
+            pass
+        # Map each downstream to Aro ID and add pipeline
+        for down_name in downstream_names:
+            down_aro = wntr_to_aro.get(down_name, -1)
+            if down_aro >= 0 and down_aro != res_aro:
+                # Check this edge doesn't already exist
+                (min(res_aro, down_aro), max(res_aro, down_aro))
+                # Add pipeline with infinite capacity
+                network.add_pipeline(
+                    from_node=res_aro,
+                    to_node=down_aro,
+                    capacity=float('inf'),
+                    delivery_cost=1.0 if cost_formula is None else None,
+                )
+
+    # --- Preserve pipeline metadata ---
+    metadata["preserved"]["pipes"] = preserved_pipe
+
+    return network, metadata
 
     return network, metadata
 
