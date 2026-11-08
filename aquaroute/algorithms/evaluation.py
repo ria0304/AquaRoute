@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import json
 import math
+import zlib
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -23,11 +24,12 @@ def _priority_communities(network: WaterNetwork) -> List[int]:
     return [c for c, lvl in zip(communities, levels) if lvl == best]
 
 
-def jains_fairness_index(allocations: Dict[int, float], demands: Dict[int, float]) -> float:
+def jains_fairness_index(allocations: Dict[int, float], demands: Dict[int, float],
+                         normalized: bool = True) -> float:
     """Compute Jain's fairness index for water allocation.
 
-    Jain's index = (sum x_i)^2 / (n * sum x_i^2), where x_i is the allocated
-    amount for community i. Range: [1/n, 1], where 1 is perfect fairness.
+    Jain's index = (sum x_i)^2 / (n * sum x_i^2). Range: [1/n, 1], where 1 is
+    perfect fairness.
 
     Parameters
     ----------
@@ -35,13 +37,19 @@ def jains_fairness_index(allocations: Dict[int, float], demands: Dict[int, float
         Mapping of community ID -> allocated volume.
     demands : dict
         Mapping of community ID -> demand volume.
+    normalized : bool, optional
+        If True (default) the index is computed on *service ratios*
+        ``x_i = alloc_i / demand_i`` (demand-normalised fairness), which makes
+        communities with different demand sizes comparable.  If False the index
+        is computed on raw allocated volumes (volume fairness).  Both are
+        reported by the evaluation suite.
 
     Returns
     -------
     float
         Jain's fairness index. 1.0 = perfectly fair, 1/n = perfectly unfair.
     """
-    # Only consider communities with positive demand and allocation
+    # Only consider communities with positive demand and non-negative allocation
     valid_communities = [
         c for c in allocations
         if c in demands and demands[c] > 0 and allocations[c] >= 0
@@ -51,13 +59,19 @@ def jains_fairness_index(allocations: Dict[int, float], demands: Dict[int, float
         return 1.0  # No communities to evaluate
 
     n = len(valid_communities)
-    sum_allocations = sum(allocations[c] for c in valid_communities)
-    sum_squares = sum(allocations[c] ** 2 for c in valid_communities)
+    if normalized:
+        values = [allocations[c] / demands[c] for c in valid_communities]
+    else:
+        values = [allocations[c] for c in valid_communities]
+
+    sum_values = sum(values)
+    sum_squares = sum(v ** 2 for v in values)
 
     if sum_squares == 0:
-        return 1.0 if sum_allocations == 0 else 0.0
+        # Everyone receives nothing: perfectly equal (all zero service).
+        return 1.0 if sum_values == 0 else 0.0
 
-    jai_index = (sum_allocations ** 2) / (n * sum_squares)
+    jai_index = (sum_values ** 2) / (n * sum_squares)
     return min(jai_index, 1.0)
 
 
@@ -413,31 +427,44 @@ class EvaluationSuite:
         """
         metrics = {}
 
+        # ``allocations`` may be either a raw community->volume map or a full
+        # optimizer solution dict (which nests the map under "allocations").
+        if "allocations" in allocations and isinstance(allocations["allocations"], dict):
+            solution = allocations
+            alloc_map = {int(k): float(v) for k, v in solution["allocations"].items()}
+        else:
+            solution = {}
+            alloc_map = {int(k): float(v) for k, v in allocations.items()}
+
         # Basic metrics from the optimizer solution (preferred) or compute them
-        shortage = allocations.get("shortage")
+        shortage = solution.get("shortage")
         if shortage is None:
-            shortage = compute_shortage(allocations, demands)
-        fairness = allocations.get("fairness")
+            shortage = compute_shortage(alloc_map, demands)
+        fairness = solution.get("fairness")
         if fairness is None:
-            fairness = compute_fairness(allocations, demands)
-        jains_fairness = allocations.get("jains_fairness")
+            fairness = compute_fairness(alloc_map, demands)
+        jains_fairness = solution.get("jains_fairness")
         if jains_fairness is None:
-            jains_fairness = jains_fairness_index(allocations, demands)
-        delivery_cost = allocations.get("delivery_cost", 0.0)
+            jains_fairness = jains_fairness_index(alloc_map, demands, normalized=True)
+        jains_fairness_volume = solution.get("jains_fairness_volume")
+        if jains_fairness_volume is None:
+            jains_fairness_volume = jains_fairness_index(alloc_map, demands, normalized=False)
+        delivery_cost = solution.get("delivery_cost", 0.0)
 
         # Objective value using default weights
         alpha, beta, gamma = 1.0, 1.0, 1.0
         objective_value = alpha * shortage + beta * fairness + gamma * delivery_cost
 
         # Runtime and status from the optimizer solution
-        runtime = allocations.get("runtime", 0.0)
-        status = allocations.get("status", "optimal") if allocations else "unsolved"
-        solver = allocations.get("solver", "unknown") if allocations else "unknown"
-        validation_passed = allocations.get("validation_passed", True) if allocations else True
+        runtime = solution.get("runtime", 0.0)
+        status = solution.get("status", "optimal") if solution else "unsolved"
+        solver = solution.get("solver", "unknown") if solution else "unknown"
+        validation_passed = solution.get("validation_passed", True) if solution else True
 
         metrics["shortage"] = shortage
         metrics["fairness"] = fairness
         metrics["jains_fairness"] = jains_fairness
+        metrics["jains_fairness_volume"] = jains_fairness_volume
         metrics["delivery_cost"] = delivery_cost
         metrics["objective_value"] = objective_value
         metrics["runtime"] = runtime
@@ -478,8 +505,11 @@ class EvaluationSuite:
             for scenario in self.scenarios:
                 repeats = []
                 for repeat_idx in range(n_repeats):
-                    # Use unique seed for each repeat
-                    repeat_seed = base_seed + repeat_idx + hash(approach_name) % 1000
+                    # Deterministic per-approach seed.  Python's built-in
+                    # ``hash`` is salted per process (PYTHONHASHSEED) and would
+                    # make results irreproducible across runs; CRC32 is stable.
+                    approach_offset = zlib.crc32(approach_name.encode("utf-8")) % 100000
+                    repeat_seed = base_seed + repeat_idx * 1009 + approach_offset
                     random_state = np.random.RandomState(repeat_seed)
 
                     net_copy = self._copy_network()
@@ -511,6 +541,9 @@ class EvaluationSuite:
                         demands_c = {c: net_copy.G.nodes[c]["demand"]
                                     for c in net_copy.get_communities()}
                         metrics = self._compute_all_metrics(net_copy, solution, demands_c)
+                        metrics["allocations"] = {
+                            int(k): float(v) for k, v in solution["allocations"].items()}
+                        metrics["cvar"] = solution.get("cvar", 0.0)
                         metrics["approach"] = approach_name
                         metrics["scenario_type"] = scenario.get("scenario_type", "unknown")
                         metrics["repeat"] = repeat_idx
@@ -524,17 +557,19 @@ class EvaluationSuite:
                             "repeat": repeat_idx,
                             "n_communities": len(net_copy.get_communities()),
                             "n_reservoirs": len(net_copy.get_reservoirs()),
+                            "allocations": {},
                             "shortage": float("nan"),
                             "fairness": 0.0,
                             "jains_fairness": 1.0,
+                            "jains_fairness_volume": 1.0,
                             "delivery_cost": 0.0,
                             "cvar": 0.0,
                             "objective_value": float("nan"),
                             "runtime": 0.0,
                             "status": "failed",
                             "solver": "unknown",
-                            "results": metrics,
                         }
+                        metrics["results"] = dict(metrics)
 
                     repeats.append(metrics)
                 approach_results.append(self._average_repeats(repeats))
@@ -545,12 +580,19 @@ class EvaluationSuite:
 
     @staticmethod
     def _average_repeats(repeats: List[Dict]) -> Dict:
-        """Average metrics across repeats for a single approach-scenario combination."""
+        """Average metrics across repeats for a single approach-scenario combination.
+
+        The raw per-repeat observations are retained under ``"repeats_raw"`` so
+        that uncertainty intervals and significance tests can be computed from
+        the individual realisations rather than from already-averaged values.
+        """
         if not repeats:
             return {}
 
         if len(repeats) == 1:
-            return dict(repeats[0])
+            merged = dict(repeats[0])
+            merged["repeats_raw"] = [dict(repeats[0])]
+            return merged
 
         # Get all unique keys across repeats
         all_keys = set()
@@ -559,13 +601,19 @@ class EvaluationSuite:
 
         merged = {"scenario_type": repeats[0].get("scenario_type")}
         for key in all_keys:
+            if key == "repeats_raw":
+                continue
             # Collect numeric values for this key across repeats
             vals = [r[key] for r in repeats if isinstance(r.get(key), (int, float))]
             if vals:
                 merged[key] = float(np.mean(vals))
+                if len(vals) > 1:
+                    merged[f"{key}_std"] = float(np.std(vals, ddof=1))
             else:
                 merged[key] = repeats[0].get(key)
 
+        merged["n_repeats"] = len(repeats)
+        merged["repeats_raw"] = [dict(r) for r in repeats]
         return merged
 
     def export_results_csv(self, results: Dict[str, List[Dict]], filepath: str) -> None:
@@ -587,10 +635,14 @@ class EvaluationSuite:
 
         # Define CSV fields with all enhanced metrics
         fields = (
-            ["approach", "scenario_type", "repeat", "n_communities", "n_reservoirs"]
+            ["approach", "scenario_type", "repeat", "n_repeats",
+             "n_communities", "n_reservoirs"]
             + [f"alloc_{c}" for c in sorted(all_communities)]
-            + ["shortage", "fairness", "jains_fairness", "delivery_cost",
-               "cvar", "objective_value", "runtime", "status", "solver"]
+            + ["shortage", "shortage_std", "fairness", "fairness_std",
+               "jains_fairness", "jains_fairness_std",
+               "jains_fairness_volume", "jains_fairness_volume_std",
+               "delivery_cost", "delivery_cost_std",
+               "cvar", "cvar_std", "objective_value", "runtime", "status", "solver"]
         )
 
         with open(filepath, "w", newline="") as fh:
@@ -603,6 +655,7 @@ class EvaluationSuite:
                         "approach": approach_name,
                         "scenario_type": r.get("scenario_type", "unknown"),
                         "repeat": r.get("repeat", 0),
+                        "n_repeats": r.get("n_repeats", 1),
                         "n_communities": r.get("n_communities", 0),
                         "n_reservoirs": r.get("n_reservoirs", 0),
                     }
@@ -612,8 +665,11 @@ class EvaluationSuite:
                         row[f"alloc_{c}"] = r.get("allocations", {}).get(c, 0)
 
                     # Add all metrics
-                    for key in ("shortage", "fairness", "jains_fairness", "delivery_cost",
-                                "cvar", "objective_value", "runtime", "status", "solver"):
+                    for key in ("shortage", "shortage_std", "fairness", "fairness_std",
+                                "jains_fairness", "jains_fairness_std",
+                                "jains_fairness_volume", "jains_fairness_volume_std",
+                                "delivery_cost", "delivery_cost_std", "cvar", "cvar_std",
+                                "objective_value", "runtime", "status", "solver"):
                         row[key] = r.get(key, "")
 
                     writer.writerow(row)
@@ -630,21 +686,37 @@ class EvaluationSuite:
         export = []
         for approach_name, approach_result in results.items():
             for r in approach_result:
-                metrics = r.copy()
-                # Remove internal keys
-                for key in ["repeat", "n_communities", "n_reservoirs"]:
-                    metrics.pop(key, None)
-
-                export.append({
+                entry = {
                     "approach": approach_name,
                     "scenario_type": r.get("scenario_type", "unknown"),
                     "n_communities": r.get("n_communities", 0),
                     "n_reservoirs": r.get("n_reservoirs", 0),
+                    "n_repeats": r.get("n_repeats", 1),
                     "allocations": r.get("allocations", {}),
-                    **{k: metrics.get(k) for k in
-                       ("shortage", "fairness", "jains_fairness", "delivery_cost",
-                        "cvar", "objective_value", "runtime", "status", "solver")},
-                })
+                }
+                for k in ("shortage", "fairness", "jains_fairness",
+                          "jains_fairness_volume", "delivery_cost", "cvar",
+                          "objective_value", "runtime", "status", "solver"):
+                    entry[k] = r.get(k)
+                for k in ("shortage", "fairness", "jains_fairness",
+                          "jains_fairness_volume", "delivery_cost", "cvar"):
+                    std_key = f"{k}_std"
+                    if std_key in r:
+                        entry[std_key] = r.get(std_key)
+                # Preserve per-repeat observations for uncertainty analysis.
+                raw = r.get("repeats_raw")
+                if raw:
+                    entry["repeats"] = [
+                        {
+                            "repeat": rr.get("repeat", i),
+                            **{k: rr.get(k) for k in
+                               ("shortage", "fairness", "jains_fairness",
+                                "jains_fairness_volume", "delivery_cost", "cvar",
+                                "objective_value", "runtime", "status")},
+                        }
+                        for i, rr in enumerate(raw)
+                    ]
+                export.append(entry)
 
         with open(filepath, "w") as fh:
             json.dump(export, fh, indent=2)
