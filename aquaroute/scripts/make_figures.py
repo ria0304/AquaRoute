@@ -256,6 +256,7 @@ def figure_scenarios(results: Dict[str, dict], total_demands: Dict[str, float],
                frameon=False, fontsize=9)
     fig.suptitle(f"Scenario breakdown on {NETWORK_TITLES.get(network, network)}",
                  fontsize=12.5, fontweight="bold")
+    fig.get_layout_engine().set(rect=(0.0, 0.0, 1.0, 0.94), h_pad=0.04, w_pad=0.04)
     _report_overlaps(fig, f"scenario_breakdown_{network}")
     png = os.path.join(outdir, f"scenario_breakdown_{network}.png")
     fig.savefig(png, dpi=dpi, bbox_inches="tight")
@@ -455,9 +456,9 @@ def figure_hydraulic_pressure_velocity(results: Dict[str, dict],
                 rep = hv.get(approach, {}).get("supply_reduction", {})
                 if "error" in rep:
                     means.append(np.nan)
-                los.append(np.nan)
-                his.append(np.nan)
-                continue
+                    los.append(np.nan)
+                    his.append(np.nan)
+                    continue
                 h = rep.get("hydraulics", {})
                 val = h.get(key.split(".")[1], np.nan)
                 means.append(val)
@@ -578,10 +579,18 @@ def figure_statistical_summary(metas: Dict[str, dict], outdir: str,
                           color=colors, edgecolor="black", linewidth=0.6)
             for bar, v in zip(bars, vals):
                 if not np.isnan(v):
-                    ax.annotate(f"{v:+.2f}", xy=(bar.get_x()+bar.get_width()/2, v),
-                                xytext=(0, 3 if v>=0 else -8),
-                                textcoords="offset points", ha="center",
-                                va="bottom" if v>=0 else "top", fontsize=7)
+                    if v >= 0:
+                        ax.annotate(f"{v:+.2f}",
+                                    xy=(bar.get_x() + bar.get_width() / 2, v),
+                                    xytext=(0, -6), textcoords="offset points",
+                                    ha="center", va="top", fontsize=7,
+                                    color="#333333")
+                    else:
+                        ax.annotate(f"{v:+.2f}",
+                                    xy=(bar.get_x() + bar.get_width() / 2, v),
+                                    xytext=(0, 6), textcoords="offset points",
+                                    ha="center", va="bottom", fontsize=7,
+                                    color="#333333")
             ax.axhline(0, color="black", linewidth=0.8)
             ax.set_title(f"{NETWORK_TITLES.get(net,net)} | {metric}",
                          fontsize=9.5, fontweight="bold")
