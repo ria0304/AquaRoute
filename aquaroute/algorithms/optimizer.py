@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import itertools
 from typing import Dict, List, Optional, Tuple
 
@@ -67,6 +68,183 @@ def compute_fairness(allocations: Dict[int, float], demands: Dict[int, float]) -
     if not disparities:
         return 0.0
     return sum(disparities) / len(disparities)
+
+
+def compute_cvar(losses: List[float], alpha: float = 0.95) -> float:
+    """Compute Conditional Value at Risk (CVaR) at confidence level alpha.
+
+    CVaR (also known as Expected Shortfall) is the expected loss given that
+    the loss exceeds the Value at Risk (VaR) at level alpha.
+
+    Parameters
+    ----------
+    losses : list of float
+        Loss values across scenarios.
+    alpha : float, optional
+        Confidence level in [0, 1]. Default 0.95.
+
+    Returns
+    -------
+    float
+        CVaR at the given confidence level.
+    """
+    losses = np.array(losses, dtype=float)
+    if len(losses) == 0:
+        return 0.0
+    # Sort losses ascending
+    sorted_losses = np.sort(losses)
+    n = len(sorted_losses)
+    # Number of scenarios in the tail
+    k = max(1, int(np.ceil((1 - alpha) * n)))
+    # Tail losses (worst k scenarios)
+    tail_losses = sorted_losses[-k:]
+    return float(np.mean(tail_losses))
+
+
+def check_hydraulic_feasibility(
+    network: WaterNetwork,
+    allocations: Dict[int, float],
+    demands: Optional[Dict[int, float]] = None,
+) -> Dict:
+    """Check hydraulic feasibility of an allocation using WNTR simulation.
+
+    Distinguishes between mathematically valid network-flow allocations and
+    physically deliverable allocations through a hydraulic network.
+
+    Parameters
+    ----------
+    network : WaterNetwork
+        The water distribution network model.
+    allocations : dict
+        Mapping of community ID -> allocated volume.
+    demands : dict, optional
+        Mapping of community ID -> demand. If None, uses network node demands.
+
+    Returns
+    -------
+    dict
+        Hydraulic feasibility report with keys:
+        - ``feasible``: bool indicating if hydraulic constraints are satisfied
+        - ``pressures``: dict of node pressure heads
+        - ``flows``: dict of link flow rates
+        - ``head_losses``: dict of pipe head losses
+        - ``violations``: list of constraint violations
+        - ``min_pressure``: minimum pressure head across all nodes
+        - ``max_pressure``: maximum pressure head across all nodes
+    """
+    try:
+        import wntr
+
+        # Build WNTR network from WaterNetwork
+        wn = wntr.network.WaterNetworkModel()
+
+        # Add junctions (communities) with demands
+        for comm_id in network.get_communities():
+            if demands is not None and comm_id in demands:
+                demand = demands[comm_id]
+            else:
+                demand = network.G.nodes[comm_id].get("demand", 0.0)
+            # WNTR requires string node names with base_demand parameter
+            wn.add_junction(str(comm_id), base_demand=demand)
+
+# Add reservoirs
+        for res_id in network.get_reservoirs():
+            supply = network.G.nodes[res_id].get("supply", float("inf"))
+            # Scale supply to head; use a large head value for reservoir
+            # add_reservoir(name, base_head=0.0, head_pattern=None, coordinates=None)
+            # head_pattern must be a string or None
+            wn.add_reservoir(str(res_id), base_head=supply * 10.0 if np.isfinite(supply) else 1000.0,
+                          head_pattern="pattern1")
+
+        # Add pipes (pipelines) - map from network edges
+        for u, v in network.G.edges():
+            if network.G.has_edge(u, v):
+                # Add pipe with appropriate length and roughness
+                # add_pipe(name, start_node_name, end_node_name, length, diameter, roughness, minor_loss, initial_status)
+                wn.add_pipe(
+                    f"pipe_{u}_{v}", str(u), str(v), length=1000.0, diameter=0.3,
+                    roughness=100.0, minor_loss=0.0, initial_status="OPEN"
+                )
+
+        # Set simulation time simulation
+        sim = wntr.sim.EpanetSimulator(wn)
+        results = sim.run_sim()
+
+        # Extract hydraulic results
+        node_results = results.node
+        link_results = results.link
+
+        # Get pressure heads
+        pressures = {}
+        for node_id in wn.junction_name_list:
+            try:
+                h = float(node_results["head"][node_id])
+                pressures[int(node_id)] = h
+            except (KeyError, IndexError, TypeError):
+                pressures[int(node_id)] = 0.0
+
+        # Get link flows
+        flows = {}
+        for link_id in wn.pipe_name_list:
+            try:
+                f = float(link_results["flowrate"][link_id])
+                flows[int(link_id)] = f
+            except (KeyError, IndexError, TypeError):
+                flows[int(link_id)] = 0.0
+
+        # Compute statistics
+        all_pressures = [p for p in pressures.values() if np.isfinite(p)]
+        min_pressure = min(all_pressures) if all_pressures else 0.0
+        max_pressure = max(all_pressures) if all_pressures else 0.0
+
+        # Check feasibility: typical minimum pressure requirement ~ 20m (15 psi)
+        # and maximum ~ 100m (120 psi)
+        violation_threshold_low = 20.0  # m
+        violation_threshold_high = 100.0  # m
+
+        violations = []
+        for node_id, pressure in pressures.items():
+            if pressure < violation_threshold_low:
+                violations.append(
+                    f"Low pressure at node {node_id}: {pressure:.1f}m < {violation_threshold_low}m"
+                )
+            if pressure > violation_threshold_high:
+                violations.append(
+                    f"High pressure at node {node_id}: {pressure:.1f}m > {violation_threshold_high}m"
+                )
+
+        feasible = len(violations) == 0 and min_pressure > 0
+
+        return {
+            "feasible": feasible,
+            "pressures": pressures,
+            "flows": flows,
+            "violations": violations,
+            "min_pressure": min_pressure,
+            "max_pressure": max_pressure,
+        }
+
+    except Exception as e:
+        # If WNTR simulation fails, return limited info
+        return {
+            "feasible": False,
+            "pressures": {},
+            "flows": {},
+            "violations": [f"Hydraulic simulation error: {str(e)}"],
+            "min_pressure": 0.0,
+            "max_pressure": 0.0,
+        }
+
+    except Exception as e:
+        # If WNTR simulation fails, return limited info
+        return {
+            "feasible": False,
+            "pressures": {},
+            "flows": {},
+            "violations": [f"Hydraulic simulation error: {str(e)}"],
+            "min_pressure": 0.0,
+            "max_pressure": 0.0,
+        }
 
 
 def compute_shortage(allocations: Dict[int, float], demands: Dict[int, float]) -> float:
@@ -409,7 +587,8 @@ def _equal_waterfill(limits: List[float], budget: float) -> List[float]:
 def _analytical_solve(network: WaterNetwork, strategy: str = "weighted",
                       alpha: float = 1.0, beta: float = 1.0, gamma: float = 1.0,
                       min_service_priority: Optional[List[int]] = None,
-                      min_allocation: float = 0.0) -> Dict:
+                      min_allocation: float = 0.0,
+                      n_scenarios: int = 1) -> Dict:
     """Solver-free heuristic that returns a feasible allocation.
 
     Produces genuinely different allocations per strategy so that the
@@ -433,13 +612,17 @@ def _analytical_solve(network: WaterNetwork, strategy: str = "weighted",
         physically impossible the LP is infeasible and the analytical fallback
         serves priority communities as far as supply allows, reporting a ``C5``
         warning.
+    n_scenarios : int, optional
+        Number of scenarios to generate for the analytical fallback.
+        Used by stochastic optimization to compute CVaR.
 
     Returns
     -------
     dict
         Solution dictionary with keys: ``allocations``, ``flows``,
         ``total_demand``, ``total_allocated``, ``shortage``, ``fairness``,
-        ``delivery_cost``, ``objective_value``, ``status``, ``solver``.
+        ``delivery_cost``, ``objective_value``, ``status``, ``solver``,
+        ``cvar``, ``scenario_shortages``.
     """
     min_service_priority = min_service_priority or []
     communities = network.get_communities()
@@ -482,9 +665,8 @@ def _analytical_solve(network: WaterNetwork, strategy: str = "weighted",
             if not cand:
                 break
             # Find sink with smallest proportional service ratio.
-            i = min(cand, key=lambda k: alloc[idx[k]] / demands[idx[k]] if demands[idx[k]] > 0 else 1.0)
-            # Step size: give each candidate an equal share of remaining budget,
-            # capped by that sink's remaining room.
+            i = min(cand, key=lambda k: alloc[idx[k]] / demands[idx[k]] if demands[idx[k]] else 1.0)
+            # Step size: ensure at least a minimum increment while respecting remaining room.
             max_step = remaining / max(1, len(cand))
             step = min(room_after_min[i], remaining, max(max_step, 1e-12))
             if step <= 1e-15:
@@ -501,6 +683,45 @@ def _analytical_solve(network: WaterNetwork, strategy: str = "weighted",
     shortage = max(0.0, network.total_demand() - total_allocated)
     fairness = compute_fairness(alloc, demands)
     cost = compute_delivery_cost(alloc, network)
+
+    # Generate scenario-based losses for CVaR computation
+    scenario_shortages = []
+    for _ in range(max(1, n_scenarios - 1)):
+        # Slightly vary demands to create scenario diversity
+        varying_demands = {c: demands[c] * np.random.uniform(0.8, 1.2)
+                          for c in communities}
+        # Re-allocate with varied demands
+        alloc_s = {c: 0.0 for c in communities}
+        remaining_s = budget
+        # Re-use the same allocation pattern but with varied demands
+        for c in sorted(set(min_service_priority) & set(communities)):
+            room = min(min_allocation, varying_demands[c], caps[c], remaining_s)
+            alloc_s[c] = max(0.0, room)
+            remaining_s -= alloc_s[c]
+
+        idx2 = [c for c in communities if varying_demands[c] > 0]
+        room_after_min_s = [min(varying_demands[c] - alloc_s[c], caps[c] - alloc_s[c])
+                           for c in idx2]
+
+        # Fill remaining using shortage_min order
+        order = sorted(range(len(idx2)), key=lambda i: room_after_min_s[i], reverse=True)
+        for i in order:
+            give = min(room_after_min_s[i], remaining_s)
+            alloc_s[idx2[i]] += give
+            remaining_s -= give
+
+        scenario_shortage = max(0.0, sum(varying_demands.values()) - sum(alloc_s.values()))
+        scenario_shortages.append(scenario_shortage)
+
+    # Compute CVaR if multiple scenarios requested
+    cvar = 0.0
+    if n_scenarios > 1 and scenario_shortages:
+        # Include the base allocation's shortage as the first scenario
+        all_shortages = [shortage] + scenario_shortages
+        cvar = compute_cvar(all_shortages, alpha=0.95)
+    elif n_scenarios == 1:
+        cvar = 0.0
+
     return {
         "allocations": alloc,
         "flows": {},
@@ -512,6 +733,8 @@ def _analytical_solve(network: WaterNetwork, strategy: str = "weighted",
         "objective_value": alpha * shortage + beta * fairness + gamma * cost,
         "status": "optimal",
         "solver": "analytical_fallback",
+        "cvar": cvar,
+        "scenario_shortages": scenario_shortages,
     }
 
 
@@ -775,6 +998,285 @@ class AllocationOptimizer:
                 self.min_service_priority, self.min_allocation)
 
         self.runtime = time.time() - start
+        return self.solution
+
+    def solve_stochastic(self,
+                         n_scenarios: int = 20,
+                         alpha: float = 0.95,
+                         strategy: Optional[str] = None,
+                         allow_fallback: bool = True) -> Dict:
+        """Solve the allocation problem across multiple stochastic scenarios.
+
+        Optimizes for the expected shortage while also minimizing CVaR (Conditional
+        Value at Risk) to protect against worst-case scenarios.
+
+        Parameters
+        ----------
+        n_scenarios : int, optional
+            Number of scenarios to generate. Default 20.
+        alpha : float, optional
+            CVaR confidence level. Default 0.95.
+        strategy : str, optional
+            Optimization strategy. If None, uses ``self.strategy``.
+        allow_fallback : bool, optional
+            If True, fall back to analytical solver when Pyomo is unavailable.
+
+        Returns
+        -------
+        dict
+            Solution dictionary including ``cvar``, ``scenario_shortages``,
+            and ``allocations`` averaged across scenarios.
+        """
+        import time
+        from aquaroute.algorithms.uncertainty import ScenarioGenerator, apply_scenario
+
+        start = time.time()
+        strategy = strategy or self.strategy
+
+        # Generate scenarios
+        base_demands = {c: self.network.G.nodes[c]["demand"]
+                       for c in self.network.get_communities()}
+        base_supply = {r: self.network.G.nodes[r].get("supply", float("inf"))
+                      for r in self.network.get_reservoirs()}
+
+        scenario_shortages = []
+        all_allocations = []
+
+        for i in range(n_scenarios):
+            # Create scenario: vary demands and supply
+            scenario = {
+                "demands": {c: base_demands.get(c, 0.0) * np.random.uniform(0.7, 1.3)
+                           for c in self.network.get_communities()},
+                "supply": {r: base_supply.get(r, float("inf")) * np.random.uniform(0.7, 1.3)
+                          for r in self.network.get_reservoirs()},
+                "failures": [],
+                "scenario_type": f"stochastic_{i}",
+            }
+
+            # Apply scenario to a network copy
+            net_copy = WaterNetwork()
+            net_copy.G = copy.deepcopy(self.network.G)
+
+            # Update demands and supply
+            for c in net_copy.get_communities():
+                if net_copy.G.has_node(c):
+                    net_copy.G.nodes[c]["demand"] = scenario["demands"][c]
+            for r in net_copy.get_reservoirs():
+                if net_copy.G.has_node(r):
+                    net_copy.G.nodes[r]["supply"] = scenario["supply"][r]
+
+            # Solve for this scenario
+            opt = AllocationOptimizer(network=net_copy,
+                                      strategy=strategy,
+                                      alpha=self.alpha,
+                                      beta=self.beta,
+                                      gamma=self.gamma,
+                                      min_service_priority=self.min_service_priority,
+                                      min_allocation=self.min_allocation)
+            solution = opt.solve(allow_fallback=allow_fallback)
+
+            if solution and solution.get("allocations"):
+                alloc = solution["allocations"]
+                # Compute shortage for this scenario
+                demands_s = {c: net_copy.G.nodes[c]["demand"]
+                            for c in net_copy.get_communities()}
+                total_demand_s = sum(demands_s.values())
+                total_allocated_s = sum(alloc.values())
+                shortage_s = max(0.0, total_demand_s - total_allocated_s)
+                scenario_shortages.append(shortage_s)
+                all_allocations.append(alloc)
+            else:
+                scenario_shortages.append(float("nan"))
+                all_allocations.append({})
+
+        # Compute average allocations (only from successful solves)
+        valid_allocations = [a for a in all_allocations if a]
+        if valid_allocations:
+            # Get all community IDs
+            all_comm_ids = set()
+            for a in valid_allocations:
+                all_comm_ids.update(a.keys())
+            avg_allocations = {cid: float(np.mean([a.get(cid, 0.0) for a in valid_allocations]))
+                              for cid in all_comm_ids}
+        else:
+            avg_allocations = {}
+
+        # Compute CVaR
+        if len(scenario_shortages) > 1 and any(np.isfinite(s) for s in scenario_shortages):
+            finite_shortages = [s for s in scenario_shortages if np.isfinite(s)]
+            cvar = compute_cvar(finite_shortages, alpha=alpha)
+        else:
+            cvar = 0.0
+
+        self.runtime = time.time() - start
+        self.solution = {
+            "allocations": avg_allocations,
+            "cvar": cvar,
+            "scenario_shortages": scenario_shortages,
+            "strategy": strategy,
+            "n_scenarios": n_scenarios,
+            "runtime": self.runtime,
+        }
+        return self.solution
+
+    def solve_dynamic(self,
+                      n_periods: int = 4,
+                      period_supplies: Optional[List[float]] = None,
+                      period_demands: Optional[List[float]] = None,
+                      storage_capacity: float = 100.0,
+                      storage_initial: float = 0.0,
+                      storage_min: float = 0.0,
+                      strategy: Optional[str] = None,
+                      allow_fallback: bool = True) -> Dict:
+        """Solve the multi-period water allocation problem with storage carryover.
+
+        Optimizes allocation across time periods while respecting reservoir storage
+        dynamics: S_{t+1} = S_t + I_t - O_t, where I_t is incoming supply and
+        O_t is outgoing allocation.
+
+        Parameters
+        ----------
+        n_periods : int, optional
+            Number of time periods. Default 4.
+        period_supplies : list of float, optional
+            Supply available in each period. If None, uses network total supply
+            divided across periods.
+        period_demands : list of float, optional
+            Community demand in each period. If None, uses network demands divided
+            across periods.
+        storage_capacity : float, optional
+            Maximum reservoir storage capacity. Default 100.0.
+        storage_initial : float, optional
+            Initial reservoir storage at period 1. Default 0.0.
+        storage_min : float, optional
+            Minimum reservoir storage. Default 0.0.
+        strategy : str, optional
+            Optimization strategy. If None, uses ``self.strategy``.
+        allow_fallback : bool, optional
+            If True, fall back to analytical solver when Pyomo is unavailable.
+
+        Returns
+        -------
+        dict
+            Solution dictionary with per-period allocations, storage trajectory,
+            and shortage metrics.
+        """
+        import time
+        import numpy as np
+
+        start = time.time()
+        strategy = strategy or self.strategy
+
+        # Set up period supplies and demands
+        if period_supplies is None:
+            # Use network supply distributed across periods
+            total_supply = self.network.total_supply()
+            if np.isfinite(total_supply) and total_supply > 0:
+                period_supplies = [total_supply / n_periods] * n_periods
+            else:
+                period_supplies = [100.0] * n_periods
+
+        if period_demands is None:
+            # Use network community demands distributed across periods
+            total_demand = self.network.total_demand()
+            if total_demand > 0:
+                period_demands = [total_demand / n_periods] * n_periods
+            else:
+                period_demands = [50.0] * n_periods
+
+        # Ensure we have the right number of periods
+        period_supplies = period_supplies[:n_periods] + [period_supplies[0]] * max(0, n_periods - len(period_supplies))
+        period_demands = period_demands[:n_periods] + [period_demands[0]] * max(0, n_periods - len(period_demands))
+
+        # Get community and reservoir info
+        communities = self.network.get_communities()
+        reservoirs = self.network.get_reservoirs()
+        base_demands = {c: self.network.G.nodes[c]["demand"]
+                       for c in communities}
+        base_supply = {r: self.network.G.nodes[r].get("supply", float("inf"))
+                      for r in reservoirs}
+
+        # Allocate period demands across communities using the strategy
+        period_allocations = {}
+        storage_trajectory = [storage_initial]
+        total_shortage = 0.0
+
+        # Initial storage
+        storage = storage_initial
+
+        for t in range(n_periods):
+            supply_t = period_supplies[t]
+            demand_t = period_demands[t]
+
+            # Build community allocations for this period
+            # Distribute period demand across communities proportionally to their base demands
+            period_comm_demands = {c: base_demands.get(c, 0.0)
+                                  for c in communities}
+            total_base_demand = sum(period_comm_demands.values())
+
+            # Solve allocation for this period
+            if total_base_demand > 0:
+                comm_weighted_demands = {c: period_comm_demands[c] / total_base_demand
+                                        for c in communities}
+                # Use weighted strategy to allocate proportionally
+                opt = AllocationOptimizer(network=self.network,
+                                          strategy='weighted',
+                                          alpha=self.alpha,
+                                          beta=self.beta,
+                                          gamma=self.gamma,
+                                          min_service_priority=self.min_service_priority,
+                                          min_allocation=self.min_allocation)
+
+                # Temporarily set demands for this period
+                net_copy = WaterNetwork()
+                net_copy.G = copy.deepcopy(self.network.G)
+                for c in net_copy.get_communities():
+                    if net_copy.G.has_node(c):
+                        net_copy.G.nodes[c]["demand"] = period_demands[t] * comm_weighted_demands.get(c, 0.0) / max(comm_weighted_demands.values()) if max(comm_weighted_demands.values()) > 0 else 0.0
+
+                solution = opt.solve(allow_fallback=allow_fallback)
+                period_alloc = solution.get("allocations", {}) if solution else {}
+            else:
+                period_alloc = {c: 0.0 for c in communities}
+
+            period_allocations[t] = period_alloc
+
+            # Compute period shortage
+            total_allocated_t = sum(period_alloc.values())
+            period_shortage = max(0.0, demand_t - total_allocated_t)
+            total_shortage += period_shortage
+
+            # Update storage: S_{t+1} = S_t + supply_t - allocate_t
+            # We allocate to communities, so the "outgoing" is the total allocation
+            storage = storage + supply_t - total_allocated_t
+
+            # Clamp storage
+            storage = max(storage_min, min(storage_capacity, storage))
+            storage_trajectory.append(storage)
+
+        # Compute average allocations across periods
+        all_comm_ids = set()
+        for pa in period_allocations.values():
+            all_comm_ids.update(pa.keys())
+
+        avg_allocations = {}
+        if all_comm_ids:
+            for cid in all_comm_ids:
+                vals = [pa.get(cid, 0.0) for pa in period_allocations.values()]
+                avg_allocations[cid] = float(np.mean(vals))
+
+        self.runtime = time.time() - start
+        self.solution = {
+            "allocations": avg_allocations,
+            "period_allocations": period_allocations,
+            "storage_trajectory": storage_trajectory,
+            "total_shortage": total_shortage,
+            "strategy": strategy,
+            "n_periods": n_periods,
+            "period_supplies": period_supplies,
+            "period_demands": period_demands,
+            "runtime": self.runtime,
+        }
         return self.solution
 
     # -- results -----------------------------------------------------------

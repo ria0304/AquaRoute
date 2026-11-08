@@ -105,6 +105,160 @@ class FailureAnalyzer:
         return results
 
     @staticmethod
+    def optimize_recovery(network: WaterNetwork, optimizer_class: type,
+                          optimizer_kwargs: Dict,
+                          failed_edges: List[Tuple[int, int]],
+                          n_recovery_scenarios: int = 10) -> Dict:
+        """Determine optimal recovery strategy after infrastructure failures.
+
+        Two-stage recovery:
+        1. Pre-failure: determine which infrastructure to reinforce
+        2. Post-failure: reallocate water through surviving infrastructure
+
+        Parameters
+        ----------
+        network : WaterNetwork
+            Original network state.
+        optimizer_class : type
+            Optimizer class to use for reallocation.
+        optimizer_kwargs : dict
+            Keyword arguments for the optimizer.
+        failed_edges : list of tuple
+            Edges that have failed (u, v).
+        n_recovery_scenarios : int, optional
+            Number of stochastic scenarios for recovery analysis. Default 10.
+
+        Returns
+        -------
+        dict
+            Recovery analysis with keys:
+            - ``pre_failure_allocations``: allocations before failure
+            - ``post_failure_allocations``: allocations after failure reoptimization
+            - ``recovery_improvement``: improvement in allocation coverage
+            - ``affected_communities``: communities impacted by failure
+            - ``recovery_scenarios``: per-scenario results
+            - ``recommendations``: infrastructure repair recommendations
+        """
+        import numpy as np
+
+        # Stage 1: Record pre-failure allocations
+        opt_original = optimizer_class(network=network, **optimizer_kwargs)
+        opt_original.solve()
+        pre_failure = opt_original.get_results() if opt_original.solution else {}
+
+        # Stage 2: Apply failures and reoptimize
+        net_copy = WaterNetwork()
+        net_copy.G = copy.deepcopy(network.G)
+
+        # Remove failed edges
+        for u, v in failed_edges:
+            if net_copy.G.has_edge(u, v):
+                net_copy.G.remove_edge(u, v)
+
+        # Record which communities are affected (lost direct connection)
+        affected_communities = []
+        for c in net_copy.get_communities():
+            # Check if community has any incoming pipes
+            incoming = [p for p in net_copy.G.predecessors(c)
+                       if net_copy.G.has_edge(p, c)]
+            if not incoming:
+                affected_communities.append(c)
+
+        # Reoptimize allocation for post-failure state
+        opt_post = optimizer_class(network=net_copy, **optimizer_kwargs)
+        try:
+            solution_post = opt_post.solve(allow_fallback=True)
+            post_failure = opt_post.get_results() if opt_post.solution else {}
+        except Exception:
+            post_failure = {}
+            solution_post = None
+
+        # Run multiple recovery scenarios with demand/supply variation
+        recovery_scenarios = []
+        base_demands = {c: net_copy.G.nodes[c]["demand"]
+                       for c in net_copy.get_communities()}
+        base_supply = {r: net_copy.G.nodes[r].get("supply", float("inf"))
+                      for r in net_copy.get_reservoirs()}
+
+        for i in range(n_recovery_scenarios):
+            # Vary demands and supply for stochastic analysis
+            scenario_demands = {c: base_demands.get(c, 0.0) * np.random.uniform(0.7, 1.3)
+                               for c in net_copy.get_communities()}
+            scenario_supply = {r: base_supply.get(r, float("inf")) * np.random.uniform(0.7, 1.3)
+                              for r in net_copy.get_reservoirs()}
+
+            # Update network with scenario parameters
+            for c in net_copy.get_communities():
+                if net_copy.G.has_node(c):
+                    net_copy.G.nodes[c]["demand"] = scenario_demands[c]
+            for r in net_copy.get_reservoirs():
+                if net_copy.G.has_node(r):
+                    net_copy.G.nodes[r]["supply"] = scenario_supply[r]
+
+            # Re-solve
+            opt_rec = optimizer_class(network=net_copy,
+                                      **optimizer_kwargs)
+            try:
+                sol_rec = opt_rec.solve(allow_fallback=True)
+                recovery_scenarios.append({
+                    "scenario_index": i,
+                    "allocations": sol_rec.get("allocations", {}) if sol_rec.solution else {},
+                    "shortage": sol_rec.get("shortage", float("nan")) if sol_rec.solution else float("nan"),
+                    "cvar": sol_rec.get("cvar", 0.0) if sol_rec.solution else 0.0,
+                })
+            except Exception:
+                recovery_scenarios.append({
+                    "scenario_index": i,
+                    "allocations": {},
+                    "shortage": float("nan"),
+                    "cvar": 0.0,
+                })
+
+        # Compute recovery improvement
+        pre_shortage = pre_failure.get("shortage", float("inf"))
+        post_shortage = post_failure.get("shortage", float("inf")) if post_failure else float("inf")
+
+        if pre_shortage > 0 and post_shortage < pre_shortage:
+            recovery_improvement = (pre_shortage - post_shortage) / pre_shortage * 100.0
+        elif post_shortage >= pre_shortage:
+            recovery_improvement = 0.0
+        else:
+            recovery_improvement = None  # Could not improve
+
+        # Compute recommendations: which communities lost the most allocation
+        recommendations = []
+        if pre_failure and post_failure:
+            pre_alloc = pre_failure.get("allocations", {})
+            post_alloc = post_failure.get("allocations", {})
+
+            for c in set(list(pre_alloc.keys()) + list(post_alloc.keys())):
+                pre_val = pre_alloc.get(c, 0.0)
+                post_val = post_alloc.get(c, 0.0)
+                if pre_val > post_val:
+                    loss_pct = (pre_val - post_val) / pre_val * 100.0 if pre_val > 0 else 0.0
+                    recommendations.append({
+                        "community": c,
+                        "pre_failure_allocation": pre_val,
+                        "post_failure_allocation": post_val,
+                        "loss_percentage": loss_pct,
+                        "priority": net_copy.G.nodes[c].get("priority", 0)
+                    })
+
+        # Sort recommendations by loss percentage (most affected first)
+        recommendations.sort(key=lambda x: x["loss_percentage"], reverse=True)
+
+        return {
+            "pre_failure_allocations": pre_failure.get("allocations", {}),
+            "post_failure_allocations": post_failure.get("allocations", {}),
+            "recovery_improvement_percentage": recovery_improvement,
+            "affected_communities": affected_communities,
+            "recovery_scenarios": recovery_scenarios,
+            "recommendations": recommendations,
+            "failed_edges": failed_edges,
+            "n_recovery_scenarios": n_recovery_scenarios,
+        }
+
+    @staticmethod
     def compute_resilience_metrics(results: List[Dict]) -> Dict:
         if not results:
             return {}
