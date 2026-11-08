@@ -638,7 +638,7 @@ class EvaluationSuite:
 
         merged = {"scenario_type": repeats[0].get("scenario_type")}
         for key in all_keys:
-            if key == "repeats_raw":
+            if key in ("repeats_raw", "seed"):
                 continue
             # Collect numeric values for this key across repeats
             vals = [r[key] for r in repeats if isinstance(r.get(key), (int, float))]
@@ -781,6 +781,7 @@ class EvaluationSuite:
             return {}
         try:
             from aquaroute.algorithms.hydraulics import HydraulicValidator
+
             from .uncertainty import apply_scenario
             validator = HydraulicValidator(self.network, metadata)
         except Exception:
@@ -908,98 +909,6 @@ class EvaluationSuite:
     def statistical_significance(self, metric: str = "shortage",
                                   approach_a: Optional[str] = None,
                                   approach_b: Optional[str] = None) -> Optional[Dict]:
-        """Perform statistical significance test between two approaches.
-
-        Uses independent t-test with Cohen's d effect size and confidence interval.
-
-        Parameters
-        ----------
-        metric : str, optional
-            Metric to test. Default "shortage".
-        approach_a : str, optional
-            First approach name.
-        approach_b : str, optional
-            Second approach name.
-
-        Returns
-        -------
-        dict or None
-            Test results including t-statistic, p-value, effect size, and interpretation.
-        """
-        if approach_a not in self.results or approach_b not in self.results:
-            return None
-
-        a = self.results[approach_a]
-        b = self.results[approach_b]
-
-        if not a or not b:
-            return None
-
-        def _samples(rows):
-            """Flatten per-repeat observations when available, else scenario means."""
-            vals = []
-            for r in rows:
-                raw = r.get("repeats_raw")
-                if raw:
-                    vals.extend(rr[metric] for rr in raw
-                                if isinstance(rr.get(metric), (int, float)))
-                elif isinstance(r.get(metric), (int, float)):
-                    vals.append(r[metric])
-            return [v for v in vals if not np.isnan(v)]
-
-        # Extract the metric values for each repeat-scenario combination
-        sample_a = _samples(a)
-        sample_b = _samples(b)
-
-        if len(sample_a) < 2 or len(sample_b) < 2:
-            return None
-
-        import scipy.stats as stats
-
-        # Means
-        mean_a = np.mean(sample_a)
-        mean_b = np.mean(sample_b)
-
-        # Standard deviations
-        std_a = np.std(sample_a, ddof=1)
-        std_b = np.std(sample_b, ddof=1)
-
-        # Pooled standard deviation and Cohen's d
-        if std_a + std_b == 0:
-            cohens_d = 0.0
-        else:
-            pooled_std = math.sqrt(((len(sample_a) - 1) * std_a ** 2 + (len(sample_b) - 1) * std_b ** 2) / (len(sample_a) + len(sample_b) - 2))
-            cohens_d = (mean_a - mean_b) / pooled_std if pooled_std > 0 else 0.0
-
-        # Welch's t-test
-        try:
-            t_stat, p_value = stats.ttest_ind(sample_a, sample_b, equal_var=False)
-        except Exception:
-            t_stat = 0.0
-            p_value = 1.0
-
-        # Degrees of freedom (Welch-Satterthwaite)
-        try:
-            df = (std_a ** 2 / len(sample_a) + std_b ** 2 / len(sample_b)) ** 2 / (
-                (std_a ** 2 / len(sample_a)) ** 2 / (len(sample_a) - 1) + (std_b ** 2 / len(sample_b)) ** 2 / (len(sample_b) - 1)
-            )
-            df = max(df, 1)
-        except Exception:
-            df = min(len(sample_a), len(sample_b)) - 1
-
-        # Confidence interval for mean difference
-        try:
-            from scipy.stats import t as t_dist
-            h = t_dist.ppf(1 - 0.05 / 2, df)
-            ci_lower = (mean_a - mean_b) - h * math.sqrt(std_a ** 2 / len(sample_a) + std_b ** 2 / len(sample_b))
-            ci_upper = (mean_a - mean_b) + h * math.sqrt(std_a ** 2 / len(sample_a) + std_b ** 2 / len(sample_b))
-        except Exception:
-            ci_lower = None
-            ci_upper = None
-
-    def statistical_significance(self, metric: str = "shortage",
-                                  approach_a: Optional[str] = None,
-                                  approach_b: Optional[str] = None) -> Optional[Dict]:
         """Perform a *paired* statistical comparison between two approaches.
 
         Because scenarios are generated with common random numbers (the derived
@@ -1035,6 +944,8 @@ class EvaluationSuite:
             out: Dict[int, float] = {}
             for r in rows:
                 raw = r.get("repeats_raw") if isinstance(r, dict) else None
+                if raw is None:
+                    raw = r.get("repeats") if isinstance(r, dict) else None
                 if not raw:
                     continue
                 for rr in raw:
@@ -1062,11 +973,16 @@ class EvaluationSuite:
         import scipy.stats as stats
 
         # Paired t-test on the differences.
-        t_stat = 0.0; p_t = 1.0; ci_lower = None; ci_upper = None; df = n - 1
+        t_stat = 0.0
+        p_t = 1.0
+        ci_lower = None
+        ci_upper = None
+        df = n - 1
         try:
             t_stat, p_t = stats.ttest_rel(va, vb)
         except Exception:
-            t_stat = 0.0; p_t = 1.0
+            t_stat = 0.0
+            p_t = 1.0
         try:
             if std_diff > 0 and n > 1:
                 h = stats.t.ppf(1 - 0.05 / 2, df)
@@ -1074,7 +990,8 @@ class EvaluationSuite:
                 ci_lower = mean_diff - h * se
                 ci_upper = mean_diff + h * se
         except Exception:
-            ci_lower = None; ci_upper = None
+            ci_lower = None
+            ci_upper = None
 
         # Paired Cohen's d (difference SD).
         cohens_d = mean_diff / std_diff if std_diff > 0 else 0.0
@@ -1107,7 +1024,7 @@ class EvaluationSuite:
         # Use the Wilcoxon p-value as the primary (distribution-free) result.
         p_value = float(wilcoxon.get("p_value", 1.0))
         significant = p_value < 0.05
-        better = mean_a < mean_b  # lower is better for most cost/shortage metrics
+        better = mean_diff < 0  # lower is better for shortage/cost/disparity
 
         return {
             "metric": metric,
@@ -1115,6 +1032,7 @@ class EvaluationSuite:
             "approach_b": approach_b,
             "paired_t_statistic": float(t_stat),
             "paired_t_p_value": float(p_t),
+            "p_value": p_value,
             "wilcoxon_statistic": w_stat,
             "wilcoxon_p_value": p_value,
             "mean_difference": mean_diff,
@@ -1149,7 +1067,6 @@ class EvaluationSuite:
             One entry per input p-value (same order) with the Holm-adjusted
             p-value and a ``significant`` flag.
         """
-        import scipy.stats as stats
         p_arr = np.array([float(p) if p is not None and not np.isnan(p) else 1.0
                           for p in p_values], dtype=float)
         m = len(p_arr)
@@ -1159,7 +1076,8 @@ class EvaluationSuite:
             adjusted[idx] = min(1.0, (m - rank + 1) * p_arr[idx])
         # Enforce monotonicity (adjusted p-values non-decreasing with rank).
         for rank in range(2, m + 1):
-            i = order[rank - 1]; j = order[rank - 2]
+            i = order[rank - 1]
+            j = order[rank - 2]
             adjusted[i] = max(adjusted[i], adjusted[j])
         return [
             {
