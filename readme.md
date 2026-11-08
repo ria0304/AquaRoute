@@ -124,7 +124,11 @@ CSV + JSON + metadata export  →  Streamlit dashboard
 | Reproducible experiments (seeded) → CSV / JSON / metadata export | ✅ |
 | Interactive Streamlit + Plotly dashboard | ✅ |
 | Editable install, console script for experiments, GitHub Actions CI (3.10–3.12) | ✅ |
-| EPANET `.inp` import and hydraulic feasibility check (optional, needs `wntr`) | ⚙️ optional |
+| EPANET `.inp` import (`load_epanet_inp`, needs `wntr`) | 🧪 experimental |
+| Post-hoc hydraulic check (`check_hydraulic_feasibility`, needs `wntr`) | 🧪 experimental |
+| Scenario-sampled risk analysis (`solve_stochastic`) and multi-period storage (`solve_dynamic`) | 🧪 experimental |
+
+🧪 marks code that exists but is untested and has known gaps — see [Experimental Modules](#experimental-modules) before relying on its output.
 
 ---
 
@@ -184,7 +188,7 @@ Metrics reported per solution:
 | `pipeline_failure_scenario` | one or more pipelines removed |
 | `multiple_disruptions_scenario` | combined disruptions |
 
-`FailureAnalyzer.analyze_resilience` runs an optimizer across a scenario list; `compute_resilience_metrics` summarises recovery; `optimize_recovery` reallocates through surviving infrastructure; `create_stress_test_suite(network, seed=...)` builds a reproducible set of random pipeline failures. All randomness is seeded.
+`FailureAnalyzer.analyze_resilience` runs an optimizer across a scenario list; `compute_resilience_metrics` summarises recovery; `optimize_recovery` reallocates through surviving infrastructure; `create_stress_test_suite(network, seed=...)` builds a reproducible set of random pipeline failures. Scenario generation, the stress-test suite, and the experiment runner are seeded; `solve_stochastic` (see below) draws from NumPy's global random state and is not.
 
 ---
 
@@ -240,6 +244,22 @@ An interactive Streamlit app (`aquaroute/scripts/streamlit_dashboard.py`) for ex
 - **Multi-scenario comparison** — one click evaluates two weighting configurations (`min_service_first` vs `fairness_weighted`) across scenarios and reports a significance test
 
 The dashboard is a demonstration layer. The five-strategy, four-baseline comparison lives in `EvaluationSuite` and `run_experiments`.
+
+---
+
+## Experimental Modules
+
+These five pieces are in the codebase but have **no tests** and the gaps below. Treat anything they produce as exploratory, not as a research result. The core optimizer, strategies, scenarios, and evaluation suite above are the tested part of the project.
+
+| Module | What it does today | Known gaps |
+|---|---|---|
+| `load_epanet_inp` (`aquaroute/data/loaders.py`) | Converts an EPANET `.inp` into a `WaterNetwork` and records what it preserved in a metadata dict | Reservoir supply is set to `base head ÷ 10` — a scaling assumption, not a physical conversion. Every pipe gets **infinite capacity** and cost `1.0`; diameter, length, and roughness are kept in metadata only. Every community gets priority `1`. Pipes are added only in their EPANET start→end direction. Pumps are not read, and tanks become plain junctions. `to_wntr` is a best-effort stub, not a faithful round-trip. |
+| `get_benchmark_networks` (`evaluation.py`) | Builds Net1–Net3 from WNTR's bundled `.inp` files; falls back to three small sample networks | It does **not** use `load_epanet_inp`. It adds reservoirs and communities but **no pipelines** (the pipe loop is a no-op), assigns default priority, and searches a hard-coded site-packages path before scanning the working directory. The fallback sample networks add only one pipe each. |
+| `check_hydraulic_feasibility` (`optimizer.py`) | Runs EPANET through WNTR and flags nodes outside a 20–100 m pressure band | It rebuilds a synthetic model — every pipe 1000 m long, 0.3 m diameter, roughness 100, reservoir head = supply × 10 — and simulates node **demands**. The `allocations` argument is not used, so results do not depend on the allocation strategy. It reports pressure heads and flows but not velocities. |
+| `AllocationOptimizer.solve_stochastic` | Draws demand and supply multipliers in 0.7–1.3, solves each scenario independently, averages the allocations, and reports the CVaR of the scenario shortages | CVaR is **measured after the fact, not optimised** (no Rockafellar–Uryasev formulation). Randomness is not seeded by the method. |
+| `AllocationOptimizer.solve_dynamic` | Loops over periods and tracks a clamped storage level `S(t+1) = S(t) + supply − allocated` | Storage is bookkeeping, not an LP constraint, and the per-period demands are not applied to the network that is solved. Its shortage and storage numbers are not evidence about the method. |
+
+Any Net1/Net3 result, including the draft comparison plot in `figures/`, depends on EPANET loading and should be regenerated once these gaps are fixed.
 
 ---
 
@@ -311,7 +331,7 @@ AquaRoute/
 │   │   ├── uncertainty.py          # Scenario generation, resilience analysis, recovery planning
 │   │   └── evaluation.py           # Comparative evaluation, statistics, sensitivity, export
 │   ├── data/
-│   │   └── loaders.py              # EPANET .inp → WaterNetwork loader (optional, needs wntr)
+│   │   └── loaders.py              # EPANET .inp → WaterNetwork loader (experimental, needs wntr)
 │   ├── scripts/
 │   │   ├── run_experiments.py      # Reproducible experiment runner (CLI)
 │   │   └── streamlit_dashboard.py  # Interactive demo
@@ -323,6 +343,10 @@ AquaRoute/
 │
 ├── data/
 │   └── sample_network.json         # Synthetic benchmark: 2 reservoirs, 5 communities, 9 pipelines
+│
+├── figures/
+│   ├── optimization_comparison.png # Draft Net1 vs Net3 plot (to be regenerated)
+│   └── optimization_comparison.pdf
 │
 ├── .github/workflows/ci.yml        # CI: pytest matrix (3.10–3.12) + experiment smoke test
 ├── requirements.txt                # Pinned runtime dependencies (incl. HiGHS)
@@ -513,6 +537,9 @@ summary = suite.compute_summary_metrics()
 | `compute_shortage`, `compute_fairness`, `compute_delivery_cost` | Standalone metric functions |
 | `validate_solution` | Constraint checks C1–C5 |
 | `effective_capacities`, `max_total_deliverable` | Upper bounds on what the network can deliver |
+| `compute_cvar(losses, alpha)` | CVaR of a list of losses (a reported metric, not an optimisation objective) |
+| 🧪 `.solve_stochastic(...)`, `.solve_dynamic(...)` | Experimental — see [Experimental Modules](#experimental-modules) |
+| 🧪 `check_hydraulic_feasibility(network, allocations, demands)` | Experimental WNTR check — see [Experimental Modules](#experimental-modules) |
 
 **Uncertainty — `aquaroute.algorithms.uncertainty`**
 
@@ -532,7 +559,8 @@ summary = suite.compute_summary_metrics()
 | `EvaluationSuite` | Approaches × scenarios × repeats, with statistics and export |
 | `compare_approaches(network, ...)` | One-call convenience wrapper (20 repeats) |
 | `jains_fairness_index`, `compute_cvar_from_scenarios` | Extra fairness and tail-risk metrics |
-| `get_benchmark_networks()` | EPANET Net1–Net3 when `.inp` files and `wntr` are available |
+| 🧪 `get_benchmark_networks()` | Experimental — builds Net1–Net3 from WNTR's bundled files, or three tiny sample networks otherwise. See [Experimental Modules](#experimental-modules) |
+| 🧪 `aquaroute.data.loaders.load_epanet_inp(path)` | Experimental EPANET import returning `(network, metadata)` |
 
 ---
 
@@ -551,7 +579,7 @@ The suite (47 test functions) verifies:
 - **Reproducibility** — identical seeds give identical results
 - **Result export** — CSV / JSON round-trips
 
-CI runs `pytest` on Python 3.10, 3.11, and 3.12, then a one-repeat experiment as a smoke test. To lint locally, install Ruff yourself (`pip install ruff`) and run `ruff check aquaroute`.
+None of the [experimental modules](#experimental-modules) is covered by these tests. CI runs `pytest` on Python 3.10, 3.11, and 3.12, then a one-repeat experiment as a smoke test. To lint locally, install Ruff yourself (`pip install ruff`) and run `ruff check aquaroute`.
 
 ---
 
@@ -579,12 +607,14 @@ Local-only. The project runs from the command line and a local Streamlit server 
 
 ## Known Limitations
 
-- **Volumetric flow, not hydraulics.** The LP models flow, capacity, and cost. Pressure, head loss, water quality, and pipe sizing are not part of the optimisation; `check_hydraulic_feasibility` offers an optional post-hoc WNTR check on a finished allocation.
-- **Synthetic data by default.** No real utility dataset ships with the project; the sample network is a benchmark. EPANET import exists but needs `wntr`, which is not a declared dependency.
+- **Volumetric flow, not hydraulics.** The LP models flow, capacity, and cost. Pressure, head loss, water quality, and pipe sizing are not part of the optimisation. `check_hydraulic_feasibility` is experimental and currently simulates a synthetic pipe network driven by demands, not the allocation itself.
+- **Synthetic data by default.** No real utility dataset ships with the project; the sample network is a benchmark. The EPANET paths are experimental: the loader assigns infinite pipe capacity, unit cost, and uniform priority and derives reservoir supply from head, and `get_benchmark_networks` adds no pipelines at all, so Net1–Net3 runs do not yet test capacity or priority behaviour. It also needs `wntr`, which is not a declared dependency.
 - **Costs are estimates.** Delivery cost uses a per-unit edge cost, or a cheapest-incoming lower bound when only volumetric allocations are known.
 - **The fallback is heuristic.** The analytical fallback (used without a solver or on infeasibility) prioritises service as far as supply allows but is not guaranteed optimal.
 - **Fairness is one metric in the objective.** Proportional disparity drives the model; Jain's index and CVaR are reported but not optimised, and other equity notions (e.g. Gini) are not modelled.
-- **Scenario-based uncertainty.** Disruptions are sampled or specified scenarios, not a stochastic or robust optimisation model.
+- **Scenario-based uncertainty.** Disruptions are sampled or specified scenarios, re-solved one at a time. CVaR is computed from the resulting shortages; it is not optimised, so this is not a stochastic or robust optimisation model.
+- **No multi-period model yet.** `solve_dynamic` tracks storage but does not enforce it in the LP, so the project does not currently model shortages carried across time.
+- **Experimental code is untested.** See [Experimental Modules](#experimental-modules).
 - **Dashboard comparison is narrower than the suite.** The dashboard compares two weighting configurations; the full baseline comparison runs through `EvaluationSuite` and `run_experiments`.
 - **Local only.** No Dockerfile and no hosted deployment.
 
@@ -596,12 +626,11 @@ Local-only. The project runs from the command line and a local Streamlit server 
 
 | Feature | Why |
 |---|---|
-| Real utility datasets | Validate against measured demand, supply, and network topology |
 | Pressure & hydraulic constraints in the model | Move from volumetric flow to hydraulically realistic routing |
 | Richer equity metrics | Optimise against Gini and priority-weighted fairness, not just report them |
 | Stochastic / robust optimization | Model supply and demand uncertainty directly rather than by scenario sampling |
-| Larger benchmark suite | Standardise networks so results are comparable across papers |
 | Declare optional dependencies | Add `wntr` and `matplotlib` as extras so the EPANET loader and plots install cleanly |
+| History-aware fairness | Let past shortages shift who bears the next one, so the same communities are not repeatedly short — the stated motivation, not yet modelled |
 
 ---
 
