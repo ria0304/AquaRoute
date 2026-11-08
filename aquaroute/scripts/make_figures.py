@@ -368,6 +368,249 @@ def _report_overlaps(fig, name: str) -> int:
     return len(overlaps)
 
 
+def load_meta(results_dir: str, network: str) -> Optional[dict]:
+    path = _latest(os.path.join(results_dir, f"meta_{network}_*.json"))
+    if not path:
+        return None
+    with open(path) as fh:
+        return json.load(fh)
+
+
+def figure_volume_fairness(results: Dict[str, dict], total_demands: Dict[str, float],
+                           outdir: str, dpi: int = 300) -> Optional[str]:
+    """Volume-based Jain's index across networks x approaches."""
+    networks = [n for n in ("Net1", "Net2", "Net3") if n in results]
+    if not networks:
+        return None
+    fig, axes = plt.subplots(1, len(networks), figsize=(4.4 * len(networks), 3.6),
+                             constrained_layout=True)
+    if len(networks) == 1:
+        axes = [axes]
+    for i, net in enumerate(networks):
+        ax = axes[i]
+        rows = results[net]["rows"]
+        means, los, his = [], [], []
+        for approach in APPROACH_ORDER:
+            vals = _raw_values(rows, approach, "jains_fairness_volume")
+            m, lo, hi = _bootstrap_ci(vals)
+            means.append(m)
+            los.append(lo)
+            his.append(hi)
+        means = np.array(means)
+        err = np.nan_to_num(np.array([means - np.array(los),
+                                      np.array(his) - means]), nan=0.0)
+        ax.bar(np.arange(len(APPROACH_ORDER)), means, width=0.72,
+               color=PALETTE[:len(APPROACH_ORDER)], edgecolor="black",
+               linewidth=0.6, yerr=err, capsize=3,
+               error_kw={"elinewidth": 0.8, "capthick": 0.8})
+        ax.set_title(f"{NETWORK_TITLES.get(net, net)}\nVolume fairness (Jain's index)",
+                     fontsize=10.5, fontweight="bold")
+        ax.set_ylim(0, 1.05)
+        ax.set_xticks(np.arange(len(APPROACH_ORDER)))
+        ax.set_xticklabels([APPROACH_TICKS[a] for a in APPROACH_ORDER],
+                           rotation=0, ha="center", fontsize=8)
+        ax.grid(axis="y", linestyle=":", alpha=0.6)
+        ax.set_axisbelow(True)
+        ax.set_ylabel("Jain's index (volume)", fontsize=9.5)
+
+    handles = [Patch(facecolor=PALETTE[k], edgecolor="black",
+                     label=APPROACH_LABELS[a])
+               for k, a in enumerate(APPROACH_ORDER)]
+    fig.legend(handles=handles, loc="outside lower center", ncol=5,
+               frameon=False, fontsize=9.5)
+    fig.suptitle("Volume-based fairness (raw allocation volumes)", fontsize=12,
+                 fontweight="bold")
+    fig.get_layout_engine().set(rect=(0.0, 0.0, 1.0, 0.94), h_pad=0.04, w_pad=0.04)
+    _report_overlaps(fig, "volume_fairness")
+    png = os.path.join(outdir, "volume_fairness.png")
+    fig.savefig(png, dpi=dpi, bbox_inches="tight")
+    fig.savefig(png.replace(".png", ".pdf"), bbox_inches="tight")
+    plt.close(fig)
+    return png
+
+
+def figure_hydraulic_pressure_velocity(results: Dict[str, dict],
+                                       metas: Dict[str, dict],
+                                       outdir: str, dpi: int = 300) -> Optional[str]:
+    """Min pressure and max velocity per approach per network (supply_reduction)."""
+    networks = [n for n in ("Net1", "Net2", "Net3") if n in results and n in metas]
+    if not networks:
+        return None
+    metrics = [("hydraulics.min_pressure", "Min pressure (m)", (0, 130)),
+               ("hydraulics.max_velocity", "Max velocity (m/s)", (0, 4))]
+    fig, axes = plt.subplots(len(metrics), len(networks),
+                             figsize=(4.4 * len(networks), 3.4 * len(metrics)),
+                             constrained_layout=True)
+    if len(metrics) == 1:
+        axes = axes.reshape(1, -1)
+    if len(networks) == 1:
+        axes = axes.reshape(-1, 1)
+    for r, (key, ylabel, ylim) in enumerate(metrics):
+        for c, net in enumerate(networks):
+            ax = axes[r][c]
+            meta = metas[net]
+            hv = meta.get("hydraulic_validation", {})
+            means, los, his = [], [], []
+            for approach in APPROACH_ORDER:
+                rep = hv.get(approach, {}).get("supply_reduction", {})
+                if "error" in rep:
+                    means.append(np.nan)
+                los.append(np.nan)
+                his.append(np.nan)
+                continue
+                h = rep.get("hydraulics", {})
+                val = h.get(key.split(".")[1], np.nan)
+                means.append(val)
+                los.append(val)
+                his.append(val)
+            means = np.array(means, dtype=float)
+            err = np.zeros((2, len(APPROACH_ORDER)))
+            ax.bar(np.arange(len(APPROACH_ORDER)), means, width=0.72,
+                   color=PALETTE[:len(APPROACH_ORDER)], edgecolor="black",
+                   linewidth=0.6, yerr=err, capsize=3)
+            ax.set_title(f"{NETWORK_TITLES.get(net, net)}\n{ylabel}",
+                         fontsize=9.5, fontweight="bold")
+            ax.set_ylim(ylim)
+            ax.set_xticks(np.arange(len(APPROACH_ORDER)))
+            ax.set_xticklabels([APPROACH_TICKS[a] for a in APPROACH_ORDER],
+                               rotation=0, ha="center", fontsize=7.5)
+            ax.grid(axis="y", linestyle=":", alpha=0.6)
+            ax.set_axisbelow(True)
+            if c == 0:
+                ax.set_ylabel(ylabel, fontsize=9)
+
+    handles = [Patch(facecolor=PALETTE[k], edgecolor="black",
+                     label=APPROACH_LABELS[a])
+               for k, a in enumerate(APPROACH_ORDER)]
+    fig.legend(handles=handles, loc="outside lower center", ncol=5,
+               frameon=False, fontsize=9)
+    fig.suptitle("Hydraulic validation under supply reduction (original EPANET model)",
+                 fontsize=11.5, fontweight="bold")
+    fig.get_layout_engine().set(rect=(0.0, 0.0, 1.0, 0.94), h_pad=0.04, w_pad=0.04)
+    _report_overlaps(fig, "hydraulic_pressure_velocity")
+    png = os.path.join(outdir, "hydraulic_pressure_velocity.png")
+    fig.savefig(png, dpi=dpi, bbox_inches="tight")
+    fig.savefig(png.replace(".png", ".pdf"), bbox_inches="tight")
+    plt.close(fig)
+    return png
+
+
+def figure_cost_shortage_tradeoff(results: Dict[str, dict],
+                                  total_demands: Dict[str, float],
+                                  outdir: str, dpi: int = 300) -> Optional[str]:
+    """Service deficit vs delivery cost per network x approach."""
+    fig, ax = plt.subplots(figsize=(7.2, 5.0), constrained_layout=True)
+    markers = {"Net1": "o", "Net2": "s", "Net3": "^"}
+    for k, approach in enumerate(APPROACH_ORDER):
+        for net in ("Net1", "Net2", "Net3"):
+            if net not in results:
+                continue
+            rows = results[net]["rows"]
+            td = total_demands.get(net, 1.0)
+            deficit = _deficit_values(rows, approach, td)
+            cost = _raw_values(rows, approach, "delivery_cost")
+            prio = _raw_values(rows, approach, "priority_service")
+            if not deficit or not cost:
+                continue
+            d_m = float(np.mean(deficit))
+            c_m = float(np.mean(cost))
+            p_m = float(np.mean(prio)) if prio else np.nan
+            size = 40 + 160 * (p_m if np.isfinite(p_m) else 0.5)
+            ax.scatter([c_m], [d_m], s=size,
+                       color=PALETTE[k], edgecolors="black", linewidths=0.7,
+                       marker=markers[net], zorder=3, alpha=0.9,
+                       label=None)
+    for k, approach in enumerate(APPROACH_ORDER):
+        ax.scatter([], [], color=PALETTE[k], edgecolors="black", linewidths=0.7,
+                   label=APPROACH_LABELS[approach])
+    for n, m in markers.items():
+        ax.scatter([], [], color="gray", edgecolors="black", linewidths=0.7,
+                   marker=m, label=NETWORK_TITLES.get(n, n))
+    ax.legend(loc="upper left", fontsize=8.5, frameon=True, ncol=2,
+              title="Approach / Network", title_fontsize=9)
+    ax.set_xlabel("Mean delivery cost (relative)  [lower is better]", fontsize=10.5)
+    ax.set_ylabel("Mean service deficit (%)  [lower is better]", fontsize=10.5)
+    ax.set_title("Cost–shortage trade-off\n(marker size = priority service)",
+                 fontsize=12, fontweight="bold")
+    ax.grid(linestyle=":", alpha=0.6)
+    ax.set_axisbelow(True)
+    _report_overlaps(fig, "cost_shortage_tradeoff")
+    png = os.path.join(outdir, "cost_shortage_tradeoff.png")
+    fig.savefig(png, dpi=dpi, bbox_inches="tight")
+    fig.savefig(png.replace(".png", ".pdf"), bbox_inches="tight")
+    plt.close(fig)
+    return png
+
+
+def figure_statistical_summary(metas: Dict[str, dict], outdir: str,
+                               dpi: int = 300) -> Optional[str]:
+    """Wilcoxon rank-biserial (AquaRoute vs each baseline) per network x metric."""
+    networks = [n for n in ("Net1", "Net2", "Net3") if n in metas]
+    if not networks:
+        return None
+    metrics = ["shortage", "jains_fairness", "priority_service", "delivery_cost"]
+    fig, axes = plt.subplots(len(networks), len(metrics),
+                             figsize=(4.2 * len(metrics), 3.2 * len(networks)),
+                             constrained_layout=True)
+    if len(networks) == 1:
+        axes = axes.reshape(1, -1)
+    if len(metrics) == 1:
+        axes = axes.reshape(-1, 1)
+    baselines = ["baseline_A_shortage_min", "baseline_B_proportional",
+                 "baseline_C_maxmin", "baseline_D_uniform"]
+    base_labels = {"baseline_A_shortage_min": "A", "baseline_B_proportional": "B",
+                   "baseline_C_maxmin": "C", "baseline_D_uniform": "D"}
+    for r, net in enumerate(networks):
+        sig = metas[net].get("significance_vs_aquaroute", {})
+        for c, metric in enumerate(metrics):
+            ax = axes[r][c]
+            vals = []
+            sigs = []
+            for b in baselines:
+                entry = sig.get(metric, {}).get(b, {})
+                rb = entry.get("rank_biserial", np.nan)
+                sig_flag = entry.get("holm_significant", False)
+                vals.append(rb if rb is not None else np.nan)
+                sigs.append(sig_flag)
+            vals = np.array(vals, dtype=float)
+            colors = ["#009E73" if s else "#999999" for s in sigs]
+            bars = ax.bar(np.arange(len(baselines)), vals, width=0.62,
+                          color=colors, edgecolor="black", linewidth=0.6)
+            for bar, v in zip(bars, vals):
+                if not np.isnan(v):
+                    ax.annotate(f"{v:+.2f}", xy=(bar.get_x()+bar.get_width()/2, v),
+                                xytext=(0, 3 if v>=0 else -8),
+                                textcoords="offset points", ha="center",
+                                va="bottom" if v>=0 else "top", fontsize=7)
+            ax.axhline(0, color="black", linewidth=0.8)
+            ax.set_title(f"{NETWORK_TITLES.get(net,net)} | {metric}",
+                         fontsize=9.5, fontweight="bold")
+            ax.set_ylim(-1.05, 1.05)
+            ax.set_xticks(np.arange(len(baselines)))
+            ax.set_xticklabels([base_labels[b] for b in baselines], fontsize=8.5)
+            ax.set_yticks([-1, -0.5, 0, 0.5, 1])
+            ax.grid(axis="y", linestyle=":", alpha=0.6)
+            ax.set_axisbelow(True)
+            if c == 0:
+                ax.set_ylabel("rank-biserial vs AquaRoute", fontsize=9)
+
+    handles = [Patch(facecolor="#009E73", edgecolor="black",
+                     label="significant (Holm-corrected p<0.05)"),
+               Patch(facecolor="#999999", edgecolor="black",
+                     label="not significant")]
+    fig.legend(handles=handles, loc="outside lower center", ncol=2,
+               frameon=False, fontsize=9)
+    fig.suptitle("Wilcoxon rank-biserial: AquaRoute vs baselines\n(paired, common random numbers)",
+                 fontsize=11.5, fontweight="bold")
+    fig.get_layout_engine().set(rect=(0.0, 0.0, 1.0, 0.94), h_pad=0.04, w_pad=0.04)
+    _report_overlaps(fig, "statistical_summary")
+    png = os.path.join(outdir, "statistical_summary.png")
+    fig.savefig(png, dpi=dpi, bbox_inches="tight")
+    fig.savefig(png.replace(".png", ".pdf"), bbox_inches="tight")
+    plt.close(fig)
+    return png
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="Generate AquaRoute figures.")
     parser.add_argument("--results-dir", default="results")
@@ -386,6 +629,7 @@ def main(argv=None) -> int:
         raise SystemExit("No results found. Run run_experiments first.")
 
     total_demands = {net: _network_total_demand(net) for net in results}
+    metas = {net: load_meta(args.results_dir, net) for net in results}
 
     out = figure_comparison(results, total_demands, args.figures_dir, args.dpi)
     print("Wrote", out)
@@ -394,6 +638,18 @@ def main(argv=None) -> int:
     if out:
         print("Wrote", out)
     out = figure_tradeoff(results, total_demands, args.figures_dir, args.dpi)
+    if out:
+        print("Wrote", out)
+    out = figure_volume_fairness(results, total_demands, args.figures_dir, args.dpi)
+    if out:
+        print("Wrote", out)
+    out = figure_hydraulic_pressure_velocity(results, metas, args.figures_dir, args.dpi)
+    if out:
+        print("Wrote", out)
+    out = figure_cost_shortage_tradeoff(results, total_demands, args.figures_dir, args.dpi)
+    if out:
+        print("Wrote", out)
+    out = figure_statistical_summary(metas, args.figures_dir, args.dpi)
     if out:
         print("Wrote", out)
     return 0

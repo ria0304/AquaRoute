@@ -970,6 +970,31 @@ class EvaluationSuite:
         mean_diff = float(np.mean(diffs))
         std_diff = float(np.std(diffs, ddof=1)) if n > 1 else 0.0
 
+        # When all paired differences are numerically zero (e.g. supply-limited
+        # shortage where every approach delivers the same amount), report no
+        # difference rather than amplifying floating-point noise.
+        if std_diff < 1e-9 and abs(mean_diff) < 1e-9:
+            return {
+                "metric": metric,
+                "approach_a": approach_a,
+                "approach_b": approach_b,
+                "paired_t_statistic": 0.0,
+                "paired_t_p_value": 1.0,
+                "p_value": 1.0,
+                "wilcoxon_statistic": 0.0,
+                "wilcoxon_p_value": 1.0,
+                "mean_difference": 0.0,
+                "confidence_interval_lower": 0.0,
+                "confidence_interval_upper": 0.0,
+                "cohens_d_paired": 0.0,
+                "cohens_d_interpretation": "negligible",
+                "rank_biserial": 0.0,
+                "rank_biserial_interpretation": "negligible",
+                "sample_size_pairs": n,
+                "significant": False,
+                "interpretation": "No significant difference (numerically identical)",
+            }
+
         import scipy.stats as stats
 
         # Paired t-test on the differences.
