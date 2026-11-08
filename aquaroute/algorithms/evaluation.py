@@ -219,99 +219,55 @@ def statistical_test_with_effect_size(
 def get_benchmark_networks() -> Dict[str, WaterNetwork]:
     """Get benchmark water network datasets for evaluation.
 
-    Returns EPANET benchmark networks (Net1, Net2, Net3) if available,
-    otherwise returns sample configurations.
+    Loads the real EPANET benchmark networks (Net1, Net2, Net3) through the
+    :func:`aquaroute.data.loaders.load_epanet_inp` loader, which preserves the
+    physical topology, pipe diameters/lengths/roughness and demands.  The loader
+    metadata (including ``source_path`` and node mappings) is attached to each
+    network as ``network.metadata`` so hydraulic validation can be run later.
 
     Returns
     -------
     dict
         Mapping of network name to WaterNetwork instance.
     """
-    benchmark_networks = {}
+    benchmark_networks: Dict[str, WaterNetwork] = {}
 
     try:
+        import pathlib
+
         import wntr
 
-        # EPANET benchmark networks - search for wntr's bundled networks
-        networks_dir = None
-        # Try common locations
-        import pathlib
-        possible_paths = [
-            pathlib.Path(wntr.__file__).parent / "library" / "networks",
-            pathlib.Path("/home/user/.local/lib/python3.14/site-packages/wntr/library/networks"),
-            pathlib.Path("/usr/local/share/wntr/networks"),
-        ]
-        for p in possible_paths:
-            if p.is_dir():
-                networks_dir = p
-                break
+        from aquaroute.data.loaders import load_epanet_inp
 
-        if networks_dir is None:
-            # Try to find any directory with EPANET .inp files
+        networks_dir = pathlib.Path(wntr.__file__).parent / "library" / "networks"
+        if not networks_dir.is_dir():
+            networks_dir = None
             for p in pathlib.Path().rglob("*.inp"):
-                networks_dir = p.parent
-                if any(f.name.startswith("Net") for f in networks_dir.glob("*.inp")):
+                if p.name in ("Net1.inp", "Net2.inp", "Net3.inp"):
+                    networks_dir = p.parent
                     break
 
-        if networks_dir is None:
-            raise ImportError("No EPANET benchmark networks found")
-
-        for net_name in ["Net1", "Net2", "Net3"]:
-            inp_file = networks_dir / f"{net_name}.inp"
-            if inp_file.exists():
-                wn = wntr.network.WaterNetworkModel(inp_file)
-                # Convert to AquaRoute WaterNetwork
-                net = WaterNetwork()
-                # Map reservoirs
-                for res_name in wn.reservoir_name_list:
-                    res_node = int(res_name) if res_name.isdigit() else res_name
-                    # Get reservoir data from EPANET
-                    try:
-                        base_head = float(wn.query_node_attribute(res_name, "head"))
-                        net.add_reservoir(
-                            res_node,
-                            capacity=100.0,
-                            supply=base_head / 10.0  # Scale head back to supply
-                        )
-                    except Exception:
-                        net.add_reservoir(res_node, capacity=100.0, supply=float("inf"))
-
-                # Add communities (junctions with demand)
-                for junc_name in wn.junction_name_list:
-                    junc_node = int(junc_name) if junc_name.isdigit() else junc_name
-                    try:
-                        demand = float(wn.query_node_attribute(junc_name, "demand"))
-                        net.add_community(junc_node, demand=demand)
-                    except Exception:
-                        net.add_community(junc_node, demand=10.0)
-
-                # Add pipes (pipelines) - map from network edges
-                for pipe_name in wn.pipe_name_list:
-                    try:
-                        start_node = int(pipe_name.split("_")[0]) if "_" in pipe_name else int(pipe_name)
-                        end_node = int(pipe_name.split("_")[1]) if "_" in pipe_name else int(pipe_name)
-                        # Simplified: just note the network has these connections
-                        if net.G.has_node(start_node) and net.G.has_node(end_node):
-                            pass
-                    except Exception:
-                        pass
-
-                benchmark_networks[net_name] = net
-                print(f"Loaded benchmark network: {net_name} ({wn.num_nodes} nodes, {wn.num_links} links)")
-
+        if networks_dir is not None:
+            for net_name in ["Net1", "Net2", "Net3"]:
+                inp_file = networks_dir / f"{net_name}.inp"
+                if inp_file.exists():
+                    net, meta = load_epanet_inp(inp_file)
+                    net.metadata = meta
+                    benchmark_networks[net_name] = net
     except ImportError:
-        pass  # wntr not available
-    except Exception:
-        pass  # Skip on error
+        pass
 
-    # Add sample networks if no EPANET networks available
+    # Fall back to synthetic samples only if the EPANET files are unavailable.
     if not benchmark_networks:
         for i in range(1, 4):
             net = WaterNetwork()
             net.add_reservoir(i - 1, capacity=100.0, supply=100.0)
+            last = None
             for j in range(3):
-                net.add_community(i * 3 + j, demand=20.0 * (j + 1), priority=j + 1)
-            net.add_pipeline(i - 1, i * 3 + j, 50.0, 1.0)
+                cid = i * 3 + j
+                net.add_community(cid, demand=20.0 * (j + 1), priority=j + 1)
+                net.add_pipeline(i - 1, cid, 50.0, 1.0)
+                last = cid
             benchmark_networks[f"sample_{i}"] = net
 
     return benchmark_networks
@@ -344,6 +300,14 @@ class EvaluationSuite:
 
     def _default_approaches(self) -> List[Tuple[str, Dict]]:
         priority = _priority_communities(self.network)
+        # Scale the minimum-service guarantee to the network's demand units so
+        # it remains feasible on real EPANET networks (demands ~1e-3 m3/s) as
+        # well as synthetic networks (demands ~10-100).  Guarantee 25% of the
+        # smallest positive priority demand.
+        prio_demands = [self.network.G.nodes[c].get("demand", 0.0)
+                        for c in priority
+                        if self.network.G.nodes[c].get("demand", 0.0) > 0]
+        min_allocation = 0.25 * min(prio_demands) if prio_demands else 0.0
         return [
             # Baseline A: classic shortage minimisation (maximise delivered water).
             ("baseline_A_shortage_min", {"strategy": "shortage_min"}),
@@ -359,7 +323,7 @@ class EvaluationSuite:
                 "strategy": "weighted",
                 "alpha": 1.0, "beta": 1.0, "gamma": 1.0,
                 "min_service_priority": priority,
-                "min_allocation": 10.0,
+                "min_allocation": min_allocation,
             }),
         ]
 
@@ -373,11 +337,24 @@ class EvaluationSuite:
 
     def _default_scenarios(self) -> List[Dict]:
         """Get default scenario set for evaluation."""
+        # Choose real, deterministically-selected *interior* edges for the
+        # failure scenario (both endpoints are demand nodes) so the disruption
+        # reduces capacity/redundancy without trivially isolating the network.
+        communities = set(self.network.get_communities())
+        interior = []
+        for u, v in sorted(self.network.G.edges()):
+            if u in communities and v in communities:
+                cap = self.network.G[u][v].get("capacity", 0.0)
+                interior.append((cap, u, v))
+        # Fail the two highest-capacity interior links (most impactful but not
+        # necessarily disconnecting).
+        interior.sort(reverse=True)
+        failed = [(u, v) for _, u, v in interior[:2]]
         return [
             ScenarioGenerator.normal_scenario(self.network),
             ScenarioGenerator.demand_spike_scenario(self.network, 1.5),
             ScenarioGenerator.supply_reduction_scenario(self.network, 0.5),
-            ScenarioGenerator.pipeline_failure_scenario(self.network, [(0, 2), (1, 5)]),
+            ScenarioGenerator.pipeline_failure_scenario(self.network, failed),
         ]
 
     def _solve_with_optimizer(self, network: WaterNetwork, kwargs: Dict) -> Optional[Dict]:

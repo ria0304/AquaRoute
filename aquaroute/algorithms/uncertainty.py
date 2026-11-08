@@ -17,19 +17,39 @@ def apply_scenario(network: WaterNetwork, scenario: Dict) -> None:
         if network.G.has_node(r):
             network.G.nodes[r]["supply"] = s
     for u, v in scenario.get("failures", []):
+        # A physical pipe failure severs the link in *both* directions, not
+        # just the arbitrary orientation stored in the graph.
         if network.G.has_edge(u, v):
             network.G.remove_edge(u, v)
+        if network.G.has_edge(v, u):
+            network.G.remove_edge(v, u)
 
 
 def _snapshot(network: WaterNetwork, scenario_type: str, failures: List,
-              demand_scale: float = 1.0, supply_scale: float = 1.0) -> Dict:
+              demand_scale: float = 1.0, supply_scale: float = 1.0,
+              finite_supply: Optional[float] = None) -> Dict:
+    total_demand = network.total_demand()
+    reservoirs = network.get_reservoirs()
+    supply = {}
+    for r in reservoirs:
+        current = network.G.nodes[r].get("supply", float("inf"))
+        if finite_supply is not None:
+            # Cap total available supply at ``finite_supply`` distributed
+            # evenly across sources.  Used for supply-disruption scenarios
+            # where the modelled (infinite) reservoir head must be bounded.
+            per_source = finite_supply / max(1, len(reservoirs))
+            supply[r] = min(current, per_source) if np.isfinite(current) else per_source
+        elif np.isfinite(current):
+            supply[r] = current * supply_scale
+        else:
+            supply[r] = current
     return {
         "demands": {c: network.G.nodes[c]["demand"] * demand_scale
                     for c in network.get_communities()},
-        "supply": {r: network.G.nodes[r].get("supply", float("inf")) * supply_scale
-                   for r in network.get_reservoirs()},
+        "supply": supply,
         "failures": list(failures),
         "scenario_type": scenario_type,
+        "total_demand_reference": total_demand,
     }
 
 
@@ -46,7 +66,11 @@ class ScenarioGenerator:
 
     @staticmethod
     def supply_reduction_scenario(network: WaterNetwork, reduction_factor: float = 0.5) -> Dict:
-        return _snapshot(network, "supply_reduction", [], supply_scale=reduction_factor)
+        # Reservoir supply is modelled as infinite (head-driven); to create a
+        # genuine supply disruption we bound the total available supply at
+        # ``reduction_factor`` of current demand.
+        cap = reduction_factor * network.total_demand()
+        return _snapshot(network, "supply_reduction", [], finite_supply=cap)
 
     @staticmethod
     def pipeline_failure_scenario(network: WaterNetwork,
@@ -60,8 +84,9 @@ class ScenarioGenerator:
                                       reduction_factor: float = 0.6,
                                       failed_edges: Optional[List[Tuple[int, int]]] = None) -> Dict:
         existing = [(u, v) for u, v in (failed_edges or []) if network.G.has_edge(u, v)]
+        cap = reduction_factor * network.total_demand() * spike_factor
         return _snapshot(network, "multiple_disruptions", existing,
-                         demand_scale=spike_factor, supply_scale=reduction_factor)
+                         demand_scale=spike_factor, finite_supply=cap)
 
 
 class FailureAnalyzer:
