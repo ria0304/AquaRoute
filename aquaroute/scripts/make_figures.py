@@ -620,6 +620,125 @@ def figure_statistical_summary(metas: Dict[str, dict], outdir: str,
     return png
 
 
+def figure_resilience_summary(results: Dict[str, dict],
+                              total_demands: Dict[str, float],
+                              outdir: str, dpi: int = 300) -> Optional[str]:
+    """Resilience: shortage and cost across all scenarios x networks x approaches."""
+    networks = [n for n in ("Net1", "Net2", "Net3") if n in results]
+    if not networks:
+        return None
+    scenarios = ["normal", "demand_spike", "supply_reduction", "pipeline_failure"]
+    scenarios = [s for s in scenarios if any(
+        r.get("scenario_type") == s for rows in results.values() for r in rows["rows"])]
+    metrics = [("deficit_pct", "Service deficit (%)", "lower"),
+               ("delivery_cost", "Delivery cost (relative)", "lower")]
+    fig, axes = plt.subplots(len(metrics), len(networks),
+                             figsize=(4.6 * len(networks), 3.4 * len(metrics)),
+                             constrained_layout=True)
+    if len(metrics) == 1:
+        axes = axes.reshape(1, -1)
+    if len(networks) == 1:
+        axes = axes.reshape(-1, 1)
+    n_ap = len(APPROACH_ORDER)
+    width = 0.8 / n_ap
+    for r, (key, ylabel, direction) in enumerate(metrics):
+        for c, net in enumerate(networks):
+            ax = axes[r][c]
+            rows = results[net]["rows"]
+            td = total_demands.get(net, 1.0)
+            x = np.arange(len(scenarios))
+            for k, approach in enumerate(APPROACH_ORDER):
+                means = []
+                for s in scenarios:
+                    if key == "deficit_pct":
+                        vals = _deficit_values(rows, approach, td, scenario=s)
+                    else:
+                        vals = _raw_values(rows, approach, key, scenario=s)
+                    m, _, _ = _bootstrap_ci(vals)
+                    means.append(m)
+                means = np.array(means, dtype=float)
+                ax.bar(x + (k - (n_ap - 1) / 2) * width, means, width=width,
+                       color=PALETTE[k], edgecolor="black", linewidth=0.5,
+                       label=None)
+            label = METRICS[key][0] if key in METRICS else ylabel
+            ax.set_title(f"{NETWORK_TITLES.get(net, net)} | {label}",
+                         fontsize=9.5, fontweight="bold")
+            ax.set_xticks(x)
+            ax.set_xticklabels([s.replace("_", " ").title() for s in scenarios],
+                               fontsize=8)
+            ax.grid(axis="y", linestyle=":", alpha=0.6)
+            ax.set_axisbelow(True)
+            if c == 0:
+                ax.set_ylabel(label, fontsize=9)
+
+    handles = [Patch(facecolor=PALETTE[k], edgecolor="black",
+                     label=APPROACH_LABELS[a])
+               for k, a in enumerate(APPROACH_ORDER)]
+    fig.legend(handles=handles, loc="outside lower center", ncol=5,
+               frameon=False, fontsize=9)
+    fig.suptitle("Resilience under disruptions (all networks x scenarios)",
+                 fontsize=11.5, fontweight="bold")
+    fig.get_layout_engine().set(rect=(0.0, 0.0, 1.0, 0.94), h_pad=0.04, w_pad=0.04)
+    _report_overlaps(fig, "resilience_summary")
+    png = os.path.join(outdir, "resilience_summary.png")
+    fig.savefig(png, dpi=dpi, bbox_inches="tight")
+    fig.savefig(png.replace(".png", ".pdf"), bbox_inches="tight")
+    plt.close(fig)
+    return png
+
+
+def figure_hydraulic_flow(results: Dict[str, dict], metas: Dict[str, dict],
+                          outdir: str, dpi: int = 300) -> Optional[str]:
+    """Mean pipe flow rate under supply reduction per approach x network."""
+    networks = [n for n in ("Net1", "Net2", "Net3") if n in results and n in metas]
+    if not networks:
+        return None
+    fig, axes = plt.subplots(1, len(networks), figsize=(4.4 * len(networks), 3.6),
+                             constrained_layout=True)
+    if len(networks) == 1:
+        axes = [axes]
+    for i, net in enumerate(networks):
+        ax = axes[i]
+        meta = metas[net]
+        hv = meta.get("hydraulic_validation", {})
+        means = []
+        for approach in APPROACH_ORDER:
+            rep = hv.get(approach, {}).get("supply_reduction", {})
+            if "error" in rep:
+                means.append(np.nan); continue
+            flows = [float(v) for v in rep.get("hydraulics", {}).get("flow", {}).values()
+                     if np.isfinite(v)]
+            means.append(float(np.mean(np.abs(flows))) if flows else np.nan)
+        means = np.array(means, dtype=float)
+        ax.bar(np.arange(len(APPROACH_ORDER)), means, width=0.72,
+               color=PALETTE[:len(APPROACH_ORDER)], edgecolor="black",
+               linewidth=0.6)
+        ax.set_title(f"{NETWORK_TITLES.get(net, net)}\nMean pipe flow rate\n(supply reduction)",
+                     fontsize=10, fontweight="bold")
+        ax.set_xticks(np.arange(len(APPROACH_ORDER)))
+        ax.set_xticklabels([APPROACH_TICKS[a] for a in APPROACH_ORDER],
+                           rotation=0, ha="center", fontsize=8)
+        ax.grid(axis="y", linestyle=":", alpha=0.6)
+        ax.set_axisbelow(True)
+        ax.set_ylabel("Mean |flow| (m3/s)", fontsize=9)
+        ax.tick_params(axis="y", labelsize=8)
+
+    handles = [Patch(facecolor=PALETTE[k], edgecolor="black",
+                     label=APPROACH_LABELS[a])
+               for k, a in enumerate(APPROACH_ORDER)]
+    fig.legend(handles=handles, loc="outside lower center", ncol=5,
+               frameon=False, fontsize=9)
+    fig.suptitle("Mean pipe flow rate under supply reduction (original EPANET model)",
+                 fontsize=11.5, fontweight="bold")
+    fig.get_layout_engine().set(rect=(0.0, 0.0, 1.0, 0.94), h_pad=0.04, w_pad=0.04)
+    _report_overlaps(fig, "hydraulic_flow")
+    png = os.path.join(outdir, "hydraulic_flow.png")
+    fig.savefig(png, dpi=dpi, bbox_inches="tight")
+    fig.savefig(png.replace(".png", ".pdf"), bbox_inches="tight")
+    plt.close(fig)
+    return png
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="Generate AquaRoute figures.")
     parser.add_argument("--results-dir", default="results")
@@ -659,6 +778,12 @@ def main(argv=None) -> int:
     if out:
         print("Wrote", out)
     out = figure_statistical_summary(metas, args.figures_dir, args.dpi)
+    if out:
+        print("Wrote", out)
+    out = figure_resilience_summary(results, total_demands, args.figures_dir, args.dpi)
+    if out:
+        print("Wrote", out)
+    out = figure_hydraulic_flow(results, metas, args.figures_dir, args.dpi)
     if out:
         print("Wrote", out)
     return 0
