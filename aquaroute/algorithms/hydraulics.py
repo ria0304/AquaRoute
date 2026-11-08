@@ -58,6 +58,7 @@ class HydraulicValidator:
         self.source_path = pathlib.Path(source)
         self.original_model = wntr.network.WaterNetworkModel(str(self.source_path))
         self.aro_to_wntr = {int(k): v for k, v in self.metadata.get("aro_to_wntr", {}).items()}
+        self.wntr_to_aro = {v: int(k) for k, v in self.aro_to_wntr.items()}
         # Original (full) junction base demands in m3/s.
         self.base_demands: Dict[str, float] = {}
         for j in self.original_model.junction_name_list:
@@ -136,8 +137,12 @@ class HydraulicValidator:
         supply: Dict = scenario.get("supply") or {}
 
         # 1) Demand spike / scenario demands: set junction base demands directly.
+        #  Scenario demands may be keyed either by WNTR junction name or by
+        #  AquaRoute community id (the optimizer graph uses community ids).
         for j in self.original_model.junction_name_list:
-            scen_demand = float(scenario_demands.get(j, self.base_demands.get(j, 0.0)))
+            aro = self.wntr_to_aro.get(j)
+            scen_demand = float(scenario_demands.get(
+                aro, scenario_demands.get(j, self.base_demands.get(j, 0.0))))
             try:
                 model.get_node(j).demand_timeseries_list[0].base_value = scen_demand
             except Exception:
@@ -199,7 +204,8 @@ class HydraulicValidator:
             if jname is None or jname not in model.junction_name_list:
                 continue
             scen_demand = float(scenario.get("demands", {}).get(
-                jname, self.base_demands.get(jname, 0.0)))
+                c, scenario.get("demands", {}).get(jname,
+                                                  self.base_demands.get(jname, 0.0))))
             alloc = max(0.0, float(allocations.get(c, 0.0)))
             if scen_demand > 0:
                 fraction = min(1.0, alloc / scen_demand)

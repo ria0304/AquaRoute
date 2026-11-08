@@ -705,7 +705,8 @@ def figure_hydraulic_flow(results: Dict[str, dict], metas: Dict[str, dict],
         for approach in APPROACH_ORDER:
             rep = hv.get(approach, {}).get("supply_reduction", {})
             if "error" in rep:
-                means.append(np.nan); continue
+                means.append(np.nan)
+                continue
             flows = [float(v) for v in rep.get("hydraulics", {}).get("flow", {}).values()
                      if np.isfinite(v)]
             means.append(float(np.mean(np.abs(flows))) if flows else np.nan)
