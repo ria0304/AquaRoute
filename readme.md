@@ -48,7 +48,7 @@ A user supplies a network in one of four ways:
 
 - **Code** — build it with `add_reservoir`, `add_community`, `add_pipeline`
 - **JSON** — load a network file such as `data/sample_network.json`
-- **EPANET** — convert a `.inp` file with `load_epanet_inp`, or use the bundled Net1 / Net2 / Net3 benchmarks (needs `wntr`)
+- **EPANET** — convert a `.inp` file with `load_epanet_inp`, or use the bundled Net1 / Net2 / Net3 benchmarks (via `wntr`, installed with AquaRoute)
 - **Dashboard** — start from the built-in sample and tune scenarios interactively
 
 The system outputs:
@@ -131,13 +131,13 @@ CSV + JSON + metadata export  →  figures  /  Streamlit dashboard
 | Reproducible experiments (seeded) → CSV / JSON / metadata export | ✅ |
 | Interactive Streamlit + Plotly dashboard | ✅ |
 | Editable install, console script for experiments, GitHub Actions CI (3.10–3.12) | ✅ |
-| EPANET `.inp` import with real topology and Hazen–Williams capacities (`load_epanet_inp`, needs `wntr`) | 🧪 experimental |
+| EPANET `.inp` import with real topology and Hazen–Williams capacities (`load_epanet_inp`) | 🧪 experimental |
 | EPANET Net1 / Net2 / Net3 benchmark runs (`--network Net1`) | 🧪 experimental |
 | Post-hoc hydraulic validation on the original EPANET model (`HydraulicValidator`, `--hydraulic`) | 🧪 experimental |
 | Figure generation (`make_figures.py`, needs `matplotlib`) | 🧪 experimental |
 | Scenario-sampled risk analysis (`solve_stochastic`) and multi-period storage (`solve_dynamic`) | 🧪 experimental |
 
-🧪 marks code that exists and runs but has **no automated tests** and the caveats listed in [Experimental Modules](#experimental-modules). Read that section before relying on its output.
+🧪 marks code that exists and runs but has **limited or no automated tests** (the EPANET loader and validator are tested; figures and `solve_stochastic` are not) and the caveats listed in [Experimental Modules](#experimental-modules). Read that section before relying on its output.
 
 ---
 
@@ -246,9 +246,9 @@ subject to source availability, pipeline capacities, and required minimum servic
 | Uncertainty on estimates | `bootstrap_ci` |
 | Required sample size | `power_analysis(metric, effect_size, alpha, power)` |
 | Weight sensitivity | `sensitivity_analysis(metric, approach, param, values)` |
-| EPANET hydraulic check | `hydraulic_validation_report()` (🧪, needs `wntr` and an EPANET-sourced network) |
+| EPANET hydraulic check | `hydraulic_validation_report()` (🧪, needs an EPANET-sourced network) |
 | Export | `export_results_csv`, `export_results_json` |
-| Plot | `plot_results(...)` (needs `matplotlib`, not a declared dependency) |
+| Plot | `plot_results(...)` (needs `matplotlib`: `pip install -e ".[figures]"`) |
 
 ---
 
@@ -289,11 +289,11 @@ The dashboard is a demonstration layer. The five-strategy, four-baseline compari
 
 ## Experimental Modules
 
-These pieces exist and ran successfully in manual checks (EPANET Net1 and Net3 comparisons, a Net1 hydraulic run, and figure generation), but have **no automated tests**. CI does not install `wntr` or `matplotlib`, so it does not exercise them. Treat their output as exploratory, not as a research result.
+These pieces exist and ran successfully in manual checks (EPANET Net1 and Net3 comparisons, a Net1 hydraulic run, and figure generation), but have only partial automated tests. The loader and `HydraulicValidator` are covered by `test_reproducibility_hydraulics.py`, which runs in CI (`wntr` is now a declared dependency); `make_figures.py` and `solve_stochastic` are untested, and CI does not install `matplotlib`. Treat their output as exploratory, not as a research result.
 
 | Module | What it does today | Caveats |
 |---|---|---|
-| `load_epanet_inp` (`aquaroute/data/loaders.py`) | Converts an EPANET `.inp` into a `WaterNetwork` using the real topology: reservoirs and tanks become sources, junctions become communities, pipes become links. Pipe capacity comes from pipe geometry through the Hazen–Williams relation `Q = 0.278·C·D^2.63·S^0.54` at a fixed reference gradient `S = 0.001` m/m. Pumps and valves get a large finite capacity. Returns a metadata record of what was preserved and what was invented. | Sources are modelled as **unbounded** (head does not cap volume). Capacity is a **proxy** tied to the reference gradient, not a hydraulic result. Delivery cost is a flat `1.0` per link. Every community is loaded with priority `1`. Links are added in both directions. The `capacity_formula`, `cost_formula`, and `demand_unit` arguments are currently only **recorded in the metadata**; they do not change the conversion. The module imports `wntr` at the top, so importing it without `wntr` fails. |
+| `load_epanet_inp` (`aquaroute/data/loaders.py`) | Converts an EPANET `.inp` into a `WaterNetwork` using the real topology: reservoirs and tanks become sources, junctions become communities, pipes become links. Pipe capacity comes from pipe geometry through the Hazen–Williams relation `Q = 0.278·C·D^2.63·S^0.54` at a fixed reference gradient `S = 0.001` m/m. Pumps and valves get a large finite capacity. Returns a metadata record of what was preserved and what was invented. | Sources are modelled as **unbounded** (head does not cap volume). Capacity is a **proxy** tied to the reference gradient, not a hydraulic result. Delivery cost is a flat `1.0` per link. Every community is loaded with priority `1`. Links are added in both directions. The `capacity_formula`, `cost_formula`, and `demand_unit` arguments are currently only **recorded in the metadata**; they do not change the conversion. The module imports `wntr` at the top; `wntr` is a declared dependency, so a normal install provides it. |
 | `get_benchmark_networks` (`evaluation.py`) | Loads Net1, Net2, and Net3 through `load_epanet_inp` from WNTR's bundled example files and attaches the loader metadata (including `source_path`) to each network. Falls back to three tiny synthetic `sample_N` networks if `wntr` or the files are unavailable. | Inherits every caveat of the loader. Net1–Net3 are standard EPANET *example* networks, not utility data. |
 | `HydraulicValidator`, `validate_allocation` (`aquaroute/algorithms/hydraulics.py`) | Replays each allocation as junction demands in the **original EPANET model** and runs the EPANET engine through WNTR. Scenarios are applied physically: demand spikes scale demands, pipeline failures close pipes, supply reductions cap source outflow (flow-control valves on pipe outlets, reduced speed on pumps). Reports pressure against a 20–100 m band, velocity against 2 m/s, new violations versus the full-demand baseline, and how far pressures and flows depart from that baseline. | Needs `metadata["source_path"]` from an EPANET-sourced network. Steady-state, first period only. It is a **post-hoc check**, not part of the optimisation. In a 2-repeat Net1 run all 20 approach × scenario checks reported feasible with minimum pressure around 78–80 m; treat that as a smoke result, not validation. |
 | `check_hydraulic_feasibility` (`optimizer.py`) | An older WNTR check that rebuilds a synthetic model (1000 m pipes, 0.3 m diameter, roughness 100) and simulates demands. | Superseded by `HydraulicValidator`. It ignores the `allocations` argument, so its result does not depend on the strategy. |
@@ -354,8 +354,8 @@ flowchart LR
 | Optimization | [Pyomo](https://www.pyomo.org/) | Express allocation objectives and constraints |
 | Solver | HiGHS (via `highspy`), CBC, or GLPK | Solve the linear program |
 | Data processing | NumPy, pandas, SciPy | Demands, capacities, simulation data, statistical tests |
-| Hydraulics | [WNTR](https://usepa.github.io/WNTR/) (EPANET engine) | EPANET import and hydraulic validation — optional, not a declared extra |
-| Figures | Matplotlib | `make_figures.py` and `plot_results` — optional, not a declared extra |
+| Hydraulics | [WNTR](https://usepa.github.io/WNTR/) (EPANET engine) | EPANET import and hydraulic validation — core dependency (plus `six`, which wntr imports but does not declare) |
+| Figures | Matplotlib | `make_figures.py` and `plot_results` — optional `figures` extra |
 | Dashboard | Streamlit, Plotly | Interactive demonstration |
 | Testing | pytest, pytest-cov | Algorithm behaviour and constraints |
 | Linting | Ruff (configured in `pyproject.toml`) | Correctness and import hygiene |
@@ -387,7 +387,8 @@ AquaRoute/
 │       ├── test_optimizer.py       # supply / pipeline binding, transshipment, min service, cost
 │       ├── test_uncertainty.py     # scenarios, resilience, seeded reproducibility
 │       ├── test_water_network.py   # graph construction + JSON loading
-│       └── test_evaluation.py      # baseline distinctness, export, summary metrics
+│       ├── test_evaluation.py      # baseline distinctness, export, summary metrics
+│       └── test_reproducibility_hydraulics.py  # seed derivation, EPANET loader, hydraulic validation
 │
 ├── data/
 │   └── sample_network.json         # Synthetic benchmark: 2 reservoirs, 5 communities, 9 pipelines
@@ -395,7 +396,7 @@ AquaRoute/
 ├── figures/                        # PNG + PDF output of make_figures.py (regenerate to reproduce)
 │
 ├── .github/workflows/ci.yml        # CI: pytest matrix (3.10–3.12) + experiment smoke test
-├── requirements.txt                # Pinned runtime dependencies (incl. HiGHS)
+├── requirements.txt                # Pinned runtime dependencies (incl. wntr, six, HiGHS)
 ├── requirements-dev.txt            # Dashboard + test tooling
 ├── pyproject.toml                  # Packaging, extras, console scripts, pytest + ruff config
 ├── research_project.odt            # Research proposal and project background
@@ -425,8 +426,10 @@ Optional extras:
 ```bash
 pip install -e ".[dashboard]"   # Streamlit + Plotly
 pip install -e ".[dev]"         # pytest + coverage
-pip install wntr matplotlib     # EPANET benchmarks, hydraulic validation, figures
+pip install -e ".[figures]"     # Matplotlib, for make_figures.py and plot_results
 ```
+
+`wntr` (EPANET import, benchmarks, hydraulic validation) and its undeclared `six` dependency are installed automatically by both commands above.
 
 Without a solver backend installed, AquaRoute still runs — it automatically uses the built-in analytical fallback. **That fallback is a heuristic, so check the `solver` field in the output before drawing conclusions** (see [Verify it works](#verify-it-works)).
 
@@ -485,12 +488,12 @@ print(r["solver"], r["shortage"], r["validation_passed"])
 
 | Flag | Description |
 |---|---|
-| `--network` | `Net1`, `Net2`, `Net3` (EPANET benchmarks, needs `wntr`), or a path to a JSON network file. Empty uses the built-in sample network. |
+| `--network` | `Net1`, `Net2`, `Net3` (EPANET benchmarks), or a path to a JSON network file. Empty uses the built-in sample network. |
 | `--repeats` | Independent repeats per scenario, averaged (default **20**) |
 | `--seed` | Base random seed (default 42) |
 | `--outdir` | Output directory, created if needed (default `results`) |
 | `--label` | Optional label appended to output filenames |
-| `--hydraulic` | Replay every allocation in the original EPANET model (needs `wntr` and an EPANET benchmark) |
+| `--hydraulic` | Replay every allocation in the original EPANET model (needs an EPANET benchmark) |
 
 The runner evaluates every approach on every scenario, prints a summary table (shortage, fairness, Jain's index, priority service, cost, full-service rate), runs paired significance tests of AquaRoute against each baseline with Holm correction, and writes three files:
 
@@ -542,7 +545,7 @@ comparison = suite.run_comparison(n_repeats=5, seed=42)
 summary = suite.compute_summary_metrics()
 ```
 
-EPANET benchmark with hydraulic validation (needs `wntr`):
+EPANET benchmark with hydraulic validation:
 
 ```python
 from aquaroute.algorithms.evaluation import EvaluationSuite, get_benchmark_networks
@@ -579,9 +582,10 @@ report = suite.hydraulic_validation_report()
 |---|---|---|
 | `solver` | `highspy` | Exact LP solves (otherwise the analytical fallback is used) |
 | `dashboard` | `streamlit`, `plotly` | The interactive dashboard |
+| `figures` | `matplotlib` | `make_figures.py` and `plot_results` |
 | `dev` | `pytest`, `pytest-cov` | Running the test suite |
 
-`wntr` and `matplotlib` are **not** declared extras; install them yourself for the EPANET and figure features.
+`wntr` and `six` are core dependencies (not extras). `matplotlib` is only needed for figures, via the `figures` extra.
 
 ---
 
@@ -653,16 +657,17 @@ report = suite.hydraulic_validation_report()
 pytest
 ```
 
-The suite (47 test functions) verifies:
+The suite (60 tests) verifies:
 
 - **Optimiser correctness** — supply / pipeline binding, transshipment routing, minimum service
 - **Metric boundary conditions** — fairness and shortage at the extremes; delivery cost is not double-counted
 - **Baseline distinctness** — strategies do not collapse to the same allocation
 - **Weight sensitivity** — `alpha` / `beta` / `gamma` change the solution as expected
-- **Reproducibility** — identical seeds give identical results (within one process)
+- **Reproducibility** — identical seeds give identical results, with process-independent seed derivation and paired seeds across approaches
+- **EPANET loader fidelity and hydraulic validation** — Net2 demand clamping, WNTR name mapping, demand conservation, and pipeline-failure / demand-spike handling in `HydraulicValidator`
 - **Result export** — CSV / JSON round-trips
 
-**Not covered by tests:** the EPANET loader, `HydraulicValidator`, `make_figures.py`, `solve_stochastic`, `solve_dynamic`, cross-process seed reproducibility, and the equal-total-shortage property across strategies. CI runs `pytest` on Python 3.10, 3.11, and 3.12, then a one-repeat experiment on the sample network as a smoke test. It installs only `.[solver]` and `pytest`, so the EPANET paths are not run there. To lint locally, install Ruff yourself (`pip install ruff`) and run `ruff check aquaroute`.
+**Not covered by tests:** `make_figures.py`, `solve_stochastic`, `solve_dynamic`, and the equal-total-shortage property across strategies. CI runs `pytest` on Python 3.10, 3.11, and 3.12, then a one-repeat experiment on the sample network as a smoke test. It installs `.[solver]` and `pytest`; `wntr` comes in as a core dependency, so the EPANET loader and validator tests run there too, but `matplotlib` is not installed. To lint locally, install Ruff yourself (`pip install ruff`) and run `ruff check aquaroute`.
 
 ---
 
@@ -675,9 +680,9 @@ The suite (47 test functions) verifies:
 | Solver-dependent tests are skipped | Expected without a solver; install the `solver` extra to run them |
 | Infeasible LP | A minimum-service guarantee may be impossible; check `validation_warnings` for `C5` |
 | Dashboard won't launch | `pip install -e ".[dashboard]"`, then use `streamlit run aquaroute/scripts/streamlit_dashboard.py` |
-| `ModuleNotFoundError: wntr` | Needed for the EPANET loader, Net1–Net3, and hydraulic validation; `pip install wntr` |
+| `ModuleNotFoundError: wntr` (or `six`) | Core dependencies; re-run `pip install -e ".[solver]"` or `pip install -r requirements.txt` |
 | `--network Net1` says the benchmark could not be loaded | Same cause — install `wntr` |
-| `ModuleNotFoundError: matplotlib` | Needed for `make_figures.py` and `plot_results`; `pip install matplotlib` |
+| `ModuleNotFoundError: matplotlib` | Needed for `make_figures.py` and `plot_results`; `pip install -e ".[figures]"` |
 | `--hydraulic` reports errors | It needs an EPANET benchmark network (`Net1`/`Net2`/`Net3`), not the sample or a JSON file |
 | `make_figures` says no results found | Run `run_experiments` first, with `--outdir` matching `--results-dir`, for Net1, Net2, and/or Net3 |
 | Net3 run is slow | Lower `--repeats`; the default is 20 |
@@ -695,7 +700,6 @@ Local-only. The project runs from the command line and a local Streamlit server 
 ## Known Limitations
 
 - **Volumetric flow plus a post-hoc hydraulic check.** The LP models flow, capacity, and cost. Pressure, head loss, water quality, and pipe sizing are not part of the optimisation. `HydraulicValidator` checks the finished allocations against EPANET afterwards (steady-state, first period); it does not feed anything back into the optimiser.
-- **No real utility data.** The sample network is synthetic and Net1–Net3 are standard EPANET example networks. No operator dataset ships with the project.
 - **EPANET conversion rests on assumptions.** Sources are unbounded, pipe capacity is a Hazen–Williams proxy at a fixed reference gradient, delivery cost is a flat 1.0, and priorities come from demand quartiles rather than data. Shortage on these networks is therefore driven by the capacity proxy and by the supply-cap scenario, not by real supply limits.
 - **Total shortage is identical across the default approaches by design.** The comparison shows how strategies distribute shortage and what routing costs, not who delivers more water. It does not show that AquaRoute outperforms the baselines overall; on the sample network it has higher disparity than the proportional and max-min baselines.
 - **`feasibility_rate` means "no shortage".** It is the full-service rate, not constraint or hydraulic feasibility.
@@ -704,9 +708,8 @@ Local-only. The project runs from the command line and a local Streamlit server 
 - **Fairness is one metric in the objective.** Proportional disparity drives the model; Jain's index and CVaR are reported but not optimised, and other equity notions (e.g. Gini) are not modelled.
 - **Scenario-based uncertainty.** Disruptions are sampled or specified scenarios, re-solved one at a time. CVaR is computed from the resulting shortages; it is not optimised, and the earlier `cvar_robust` strategy is not available, so this is not a stochastic or robust optimisation model.
 - **No multi-period model yet.** `solve_dynamic` tracks storage but does not enforce it in the LP, so the project does not currently model shortages carried across time.
-- **Experimental code is untested.** See [Experimental Modules](#experimental-modules). `wntr` and `matplotlib` are not declared dependencies.
+- **Parts of the experimental code are untested.** See [Experimental Modules](#experimental-modules). `make_figures.py` and `solve_stochastic` have no automated tests.
 - **Dashboard comparison is narrower than the suite.** The dashboard compares two weighting configurations; the full baseline comparison runs through `EvaluationSuite` and `run_experiments`.
-- **Local only.** No Dockerfile and no hosted deployment.
 
 
 
@@ -716,7 +719,6 @@ Local-only. The project runs from the command line and a local Streamlit server 
 
 | Feature | Why |
 |---|---|
-| Real-data validation | Run on an operator or open-data network, including an intermittent-supply case, rather than only synthetic and EPANET example networks |
 | Pressure & hydraulic constraints in the model | Move from a post-hoc hydraulic check to hydraulically aware routing |
 | Richer equity metrics | Optimise against Gini and priority-weighted fairness, not just report them |
 | Stochastic / robust optimization | Model supply and demand uncertainty directly (e.g. a proper CVaR or budgeted-robust formulation) rather than by scenario sampling |
